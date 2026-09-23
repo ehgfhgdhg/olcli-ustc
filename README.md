@@ -43,42 +43,64 @@ Work with Overleaf projects directly from your command line. Edit locally with y
 
 ## Installation
 
-### Homebrew (macOS/Linux)
+### One-line installer (recommended)
+
+Installs from the USTC-hosted tarball and authenticates automatically:
 
 ```bash
-brew tap aloth/tap
-brew install olcli
+curl -sSL https://latex.ustc.edu.cn/agent/install.sh -o install.sh
+bash install.sh --token YOUR_TOKEN
 ```
 
-### npm (all platforms)
+Get your token by visiting `https://latex.ustc.edu.cn/agent/setup` in your browser.
+
+olcli is installed to `~/.local/olcli-ustc/bin/`. If `olcli` is not found after install, run `source ~/.bashrc` or `export PATH="$HOME/.local/olcli-ustc/bin:$PATH"`.
+
+### Manual installation
 
 ```bash
-npm install -g @aloth/olcli
+npm install -g https://latex.ustc.edu.cn/agent/olcli-ustc-latest.tgz
+olcli config set-url https://latex.ustc.edu.cn
+olcli config set-cookie-name overleaf.sid
 ```
 
-Or use with `npx` without installation:
+### For AI agents
 
-```bash
-npx @aloth/olcli list
+Fetch the skill file from the agent service:
+
+```
+https://latex.ustc.edu.cn/agent/SKILL.md
 ```
 
-### For AI agents (via AgentSkills)
-
-```bash
-npx skills add aloth/olcli
-```
+The skill file contains instructions for the agent to guide the user through the token-based auth flow.
 
 ## Quick Start
 
 ### 1. Authenticate
 
-**Session cookie** (overleaf.com and self-hosted):
+**One-time token** (recommended for headless servers):
+
+1. Visit `https://latex.ustc.edu.cn/agent/setup` in your browser
+2. Copy the install command
+3. Run on your server:
+
+```bash
+curl -sSL https://latex.ustc.edu.cn/agent/install.sh | bash -s -- --token YOUR_TOKEN
+```
+
+Or just the token:
+
+```bash
+olcli auth --token "YOUR_TOKEN"
+```
+
+**Session cookie** (manual):
 
 ```bash
 olcli auth --cookie "your_session_cookie_value"
 ```
 
-**Email/password** (self-hosted without reCAPTCHA):
+**Email/password** (non-CAS instances only):
 
 ```bash
 olcli auth --email "you@example.com" --password "your_password"
@@ -222,14 +244,20 @@ Credentials are checked in order:
 2. `.olauth` file in current directory
 3. Global config: `~/.config/olcli-nodejs/config.json`
 
+For headless servers, use `olcli auth --token` (see above).
+
 ### Self-hosted Overleaf
 
+olcli defaults to `https://latex.ustc.edu.cn` with cookie name `overleaf.sid`.
+For other instances:
+
 ```bash
-olcli config set-url https://latex.example.org
+olcli config set-url https://overleaf.yourcompany.com
 olcli config set-cookie-name overleaf.sid
+olcli auth --cookie "YOUR_COOKIE"
 ```
 
-Or pass per-command: `olcli --base-url https://latex.example.org list`
+Or pass per-command: `olcli --base-url https://overleaf.yourcompany.com list`
 
 ### Timeout
 

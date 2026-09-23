@@ -12,6 +12,7 @@ import ora from 'ora';
 import { writeFileSync, readFileSync, existsSync, mkdirSync } from 'node:fs';
 import { join, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { OverleafClient } from './client.js';
 import {
   loadIgnore,
@@ -28,6 +29,8 @@ const VERSION = pkg.version;
 import {
   getSessionCookie,
   setSessionCookie,
+  getCookieJar,
+  setCookieJar,
   getLastProject,
   setLastProject,
   getConfigPath,
@@ -51,7 +54,7 @@ program
   .description('Overleaf CLI - interact with Overleaf projects from the command line')
   .version(VERSION)
   .option('--base-url <url>', 'Overleaf instance base URL (overrides OVERLEAF_BASE_URL and config)')
-  .option('--cookie-name <name>', 'Session cookie name (default: overleaf_session2, use overleaf.sid for older instances)')
+  .option('--cookie-name <name>', 'Session cookie name (default: overleaf.sid)')
   .option('--timeout <ms>', 'HTTP request timeout in milliseconds', parseInt)
   .option('--verbose', 'Print every HTTP request, status, and error response body to stderr');
 
@@ -66,10 +69,42 @@ async function getClient(cookieOpt?: string, baseUrlOpt?: string): Promise<Overl
 
   if (cookie) {
     try {
-      const client = await OverleafClient.fromSessionCookie(cookie, baseUrl, cookieName);
+      const storedJar = getCookieJar() || {};
+      const extraCookies: Record<string, string> = {};
+      if (storedJar['lb_srv_id']) extraCookies['lb_srv_id'] = storedJar['lb_srv_id'];
+
+      let client: OverleafClient;
+      try {
+        client = await OverleafClient.fromSessionCookie(cookie, baseUrl, cookieName, extraCookies);
+      } catch {
+        await sleep(500);
+        client = await OverleafClient.fromSessionCookie(cookie, baseUrl, cookieName, extraCookies);
+      }
+
       if (program.opts().verbose) client.setVerbose(true);
       const timeout = (program.opts().timeout as number | undefined) || getTimeout();
       client.setGlobalTimeout(timeout);
+
+      const pair = client.getSessionCookiePair(cookieName);
+      if (pair && pair.value !== cookie) {
+        setSessionCookie(pair.value);
+      }
+      const lbId = client.getCookie('lb_srv_id');
+      if (lbId) {
+        setCookieJar({ [cookieName]: pair?.value || cookie, 'lb_srv_id': lbId });
+      }
+
+      client.setOnCookieUpdate(() => {
+        const p = client.getSessionCookiePair(cookieName);
+        const lb = client.getCookie('lb_srv_id');
+        const jar: Record<string, string> = {};
+        if (p) jar[cookieName] = p.value;
+        if (lb) jar['lb_srv_id'] = lb;
+        if (Object.keys(jar).length > 0) {
+          setCookieJar(jar);
+        }
+      });
+
       return client;
     } catch (error) {
       if (!passwordCredentials) throw error;
@@ -158,28 +193,43 @@ async function resolveProject(
 
 program
   .command('auth')
-  .description('Authenticate with Overleaf using a session cookie or email/password')
-  .option('--cookie <session>', 'Session cookie (overleaf_session2 value)')
+  .description('Authenticate with Overleaf using a session cookie, token, or email/password')
+  .option('--cookie <session>', 'Session cookie value')
+  .option('--token <token>', 'One-time token from the agent setup page')
+  .option('--agent-url <url>', 'Agent service URL (default: <base-url>/agent)')
+  .option('--lb-srv-id <id>', 'Load balancer server ID (lb_srv_id cookie)')
   .option('--email <email>', 'Account email for password login')
   .option('--password <password>', 'Account password for password login')
   .option('--no-save-password', 'Do not persist email/password credentials')
   .option('--save-local', 'Save to .olauth in current directory')
   .action(async (options) => {
-    if (!options.cookie && !options.email && !options.password) {
-      console.log(chalk.yellow('To authenticate, provide a session cookie:'));
+    if (!options.cookie && !options.token && !options.email && !options.password) {
+      const baseUrl = (program.opts().baseUrl as string | undefined) || getBaseUrl();
+      console.log(chalk.yellow('To authenticate, choose one of these methods:'));
       console.log();
-      console.log('1. Log into overleaf.com in your browser');
+      console.log(chalk.bold('Method 1: One-time token (recommended for headless servers)'));
+      console.log(`1. Visit ${chalk.cyan(`${baseUrl}/agent/setup`)} in your browser`);
+      console.log('2. Copy the install command or just the token');
+      console.log('3. Run on this server:');
+      console.log(chalk.cyan(`  olcli auth --token "YOUR_TOKEN"`));
+      console.log();
+      console.log(chalk.bold('Method 2: Session cookie'));
+      console.log(`1. Log into ${chalk.cyan(baseUrl)} in your browser`);
       console.log('2. Open Developer Tools (F12) → Application → Cookies');
-      console.log('3. Find the cookie named "overleaf_session2"');
+      console.log(`3. Find the cookie named "${chalk.cyan(getSessionCookieName())}"`);
       console.log('4. Copy its value and run:');
+      console.log(chalk.cyan(`  olcli auth --cookie "your_session_cookie_value"`));
       console.log();
-      console.log(chalk.cyan('  olcli auth --cookie "your_session_cookie_value"'));
-      console.log();
-      console.log('Or log in with email/password:');
+      console.log(chalk.bold('Method 3: Email/password (self-hosted without CAS)'));
       console.log(chalk.cyan('  olcli auth --email "you@example.com" --password "your_password"'));
       console.log();
-      console.log('Or set OVERLEAF_SESSION environment variable');
+      console.log(chalk.dim('Or set OVERLEAF_SESSION environment variable'));
       return;
+    }
+
+    if (options.token && (options.cookie || options.email || options.password)) {
+      console.error(chalk.red('Use --token by itself, not with --cookie or --email/--password.'));
+      process.exit(1);
     }
 
     if (options.cookie && (options.email || options.password)) {
@@ -187,24 +237,67 @@ program
       process.exit(1);
     }
 
-    if (!options.cookie && (!options.email || !options.password)) {
+    if (!options.cookie && !options.token && (!options.email || !options.password)) {
       console.error(chalk.red('Both --email and --password are required for password login.'));
       process.exit(1);
     }
 
-    const spinner = ora('Verifying session...').start();
+    const spinner = ora('Authenticating...').start();
     try {
       const baseUrl = (program.opts().baseUrl as string | undefined) || getBaseUrl();
       const cookieName = (program.opts().cookieName as string | undefined) || getSessionCookieName();
 
-      if (options.cookie) {
-        const client = await OverleafClient.fromSessionCookie(options.cookie, baseUrl, cookieName);
+      if (options.token) {
+        spinner.text = 'Exchanging token...';
+        const agentUrl = options.agentUrl || `${baseUrl}/agent/exchange`;
+        const result = await OverleafClient.exchangeToken(options.token, agentUrl);
+        setBaseUrl(result.base_url);
+        setSessionCookieName(result.cookie_name);
+
+        const lbId = result.lb_srv_id || options.lbSrvId;
+        const extraCookies: Record<string, string> = {};
+        if (lbId) extraCookies['lb_srv_id'] = lbId;
+
+        const client = await OverleafClient.fromSessionCookie(
+          result.cookie,
+          result.base_url,
+          result.cookie_name,
+          extraCookies
+        );
         const projects = await client.listProjects();
 
-        setSessionCookie(options.cookie);
+        persistClientSession(client, result.cookie_name);
+        setBaseUrl(result.base_url);
+        const finalLbId = client.getCookie('lb_srv_id');
+        if (finalLbId) {
+          setCookieJar({ [result.cookie_name]: client.getSessionCookiePair(result.cookie_name)?.value || result.cookie, 'lb_srv_id': finalLbId });
+        }
 
         if (options.saveLocal) {
-          saveOlAuth(options.cookie);
+          const sessionPair = client.getSessionCookiePair(result.cookie_name);
+          saveOlAuth(sessionPair?.value || result.cookie);
+          spinner.succeed(`Authenticated! Found ${projects.length} projects. Saved to .olauth`);
+        } else {
+          spinner.succeed(`Authenticated! Found ${projects.length} projects.`);
+        }
+      } else if (options.cookie) {
+        const lbId = options.lbSrvId;
+        const extraCookies: Record<string, string> = {};
+        if (lbId) extraCookies['lb_srv_id'] = lbId;
+
+        spinner.text = 'Verifying session...';
+        const client = await OverleafClient.fromSessionCookie(options.cookie, baseUrl, cookieName, extraCookies);
+        const projects = await client.listProjects();
+
+        persistClientSession(client, cookieName);
+        const finalLbId = client.getCookie('lb_srv_id');
+        if (finalLbId) {
+          setCookieJar({ [cookieName]: client.getSessionCookiePair(cookieName)?.value || options.cookie, 'lb_srv_id': finalLbId });
+        }
+
+        if (options.saveLocal) {
+          const sessionPair = client.getSessionCookiePair(cookieName);
+          saveOlAuth(sessionPair?.value || options.cookie);
           spinner.succeed(`Authenticated! Found ${projects.length} projects. Saved to .olauth`);
         } else {
           spinner.succeed(`Authenticated! Found ${projects.length} projects.`);
@@ -241,9 +334,7 @@ program
 
     const spinner = ora('Checking session...').start();
     try {
-      const baseUrl = (program.opts().baseUrl as string | undefined) || getBaseUrl();
-      const cookieName = (program.opts().cookieName as string | undefined) || getSessionCookieName();
-      const client = await OverleafClient.fromSessionCookie(cookie, baseUrl, cookieName);
+      const client = await getClient();
       const projects = await client.listProjects();
       spinner.succeed(`Authenticated with access to ${projects.length} projects`);
     } catch (error: any) {

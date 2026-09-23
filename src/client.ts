@@ -17,7 +17,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const pkg = JSON.parse(readFileSync(join(__dirname, '..', 'package.json'), 'utf-8'));
 const USER_AGENT = `olcli/${pkg.version}`;
 
-const DEFAULT_BASE_URL = 'https://www.overleaf.com';
+const DEFAULT_BASE_URL = 'https://latex.ustc.edu.cn';
 
 export interface Project {
   id: string;
@@ -139,6 +139,7 @@ export class OverleafClient {
   private baseUrl: string;
   private verbose: boolean = false;
   private timeoutMs: number = 10000;
+  private onCookieUpdate?: (cookies: Record<string, string>) => void;
   // Cache per-project folder trees so repeated uploads in sync/upload calls
   // don't re-fetch the tree via Socket.IO on every file.
   private folderTreeCache: Map<string, Record<string, string>> = new Map();
@@ -147,6 +148,10 @@ export class OverleafClient {
     this.cookies = credentials.cookies;
     this.csrf = credentials.csrf;
     this.baseUrl = credentials.baseUrl || DEFAULT_BASE_URL;
+  }
+
+  setOnCookieUpdate(callback: (cookies: Record<string, string>) => void): void {
+    this.onCookieUpdate = callback;
   }
 
   /** Enable or disable verbose request/response logging to stderr. */
@@ -163,7 +168,11 @@ export class OverleafClient {
     return this.cookies[name];
   }
 
-  getSessionCookiePair(preferredCookieName: string = 'overleaf_session2'): SessionCookiePair | undefined {
+  setCookie(name: string, value: string): void {
+    this.cookies[name] = value;
+  }
+
+  getSessionCookiePair(preferredCookieName: string = 'overleaf.sid'): SessionCookiePair | undefined {
     const preferredNames = [
       preferredCookieName,
       'overleaf_session2',
@@ -239,10 +248,12 @@ export class OverleafClient {
   static async fromSessionCookie(
     sessionCookie: string,
     baseUrl: string = DEFAULT_BASE_URL,
-    cookieName: string = 'overleaf_session2'
+    cookieName: string = 'overleaf.sid',
+    extraCookies?: Record<string, string>
   ): Promise<OverleafClient> {
     const cookies: Record<string, string> = {
-      [cookieName]: sessionCookie
+      [cookieName]: sessionCookie,
+      ...extraCookies
     };
 
     // Fetch CSRF token from project page
@@ -363,6 +374,55 @@ export class OverleafClient {
     return new OverleafClient({ cookies: bootstrapClient.cookies, csrf: projectCsrf, baseUrl });
   }
 
+  /**
+   * Exchange a one-time token for a session cookie via the agent service.
+   */
+  static async exchangeToken(
+    token: string,
+    agentUrl?: string
+  ): Promise<{ cookie: string; lb_srv_id?: string; base_url: string; cookie_name: string }> {
+    const DEFAULT_BASE_URL = 'https://latex.ustc.edu.cn';
+    const baseUrl = DEFAULT_BASE_URL;
+    const url = agentUrl || `${baseUrl}/agent/exchange`;
+
+    const bootstrapClient = new OverleafClient({ cookies: {}, csrf: 'bootstrap', baseUrl });
+    const body = JSON.stringify({ token });
+
+    const response = await bootstrapClient.httpRequest(url, {
+      method: 'POST',
+      headers: {
+        'User-Agent': USER_AGENT,
+        'Content-Type': 'application/json',
+        'Content-Length': String(Buffer.byteLength(body))
+      },
+      body,
+      expect: 'json',
+      maxRedirects: 0
+    });
+
+    if (response.status === 404) {
+      throw new Error('Token not found. It may be invalid.');
+    }
+
+    if (response.status === 410) {
+      const errorBody = typeof response.body === 'object' ? response.body as Record<string, unknown> : {};
+      const detail = (errorBody?.detail as string) || 'expired or already used';
+      throw new Error(`Token ${detail}.`);
+    }
+
+    if (!response.ok) {
+      throw new Error(`Token exchange failed: ${response.status}`);
+    }
+
+    const data = response.body as Record<string, any>;
+    return {
+      cookie: data.cookie,
+      lb_srv_id: data.lb_srv_id || undefined,
+      base_url: data.base_url,
+      cookie_name: data.cookie_name
+    };
+  }
+
   private static extractCsrfToken($: cheerio.CheerioAPI): string | undefined {
     let csrf = $('meta[name="ol-csrfToken"]').attr('content');
     if (!csrf) {
@@ -387,7 +447,9 @@ export class OverleafClient {
   }
 
   private getCookieHeader(): string {
-    return Object.entries(this.cookies).map(([k, v]) => `${k}=${v}`).join('; ');
+    const header = Object.entries(this.cookies).map(([k, v]) => `${k}=${v}`).join('; ');
+    this.logVerbose('Cookie header:', header);
+    return header;
   }
 
   private getHeaders(includeContentType = false): Record<string, string> {
@@ -415,11 +477,24 @@ export class OverleafClient {
 
   private applySetCookieHeaders(setCookie: string[] | undefined): void {
     if (!setCookie) return;
+    let changed = false;
     for (const setCookieHeader of setCookie) {
       const match = setCookieHeader.match(/^([^=]+)=([^;]+)/);
       if (match) {
-        this.cookies[match[1]] = match[2];
+        let value = match[2];
+        let decoded = value;
+        try {
+          decoded = decodeURIComponent(value);
+        } catch {
+          // value is not URL-encoded, use as-is
+        }
+        this.logVerbose('Set-Cookie raw:', value, '→ decoded:', decoded);
+        this.cookies[match[1]] = decoded;
+        changed = true;
       }
+    }
+    if (changed && this.onCookieUpdate) {
+      this.onCookieUpdate(this.cookies);
     }
   }
 

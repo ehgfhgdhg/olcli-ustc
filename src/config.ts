@@ -9,6 +9,7 @@ import { homedir } from 'node:os';
 
 interface OlcliConfig {
   sessionCookie?: string;
+  lbSrvId?: string;
   csrf?: string;
   lastProject?: string;
   baseUrl?: string;
@@ -27,6 +28,7 @@ const config = new Conf<OlcliConfig>({
   projectName: 'olcli',
   schema: {
     sessionCookie: { type: 'string' },
+    lbSrvId: { type: 'string' },
     csrf: { type: 'string' },
     lastProject: { type: 'string' },
     baseUrl: { type: 'string' },
@@ -38,7 +40,7 @@ const config = new Conf<OlcliConfig>({
 });
 
 export function getBaseUrl(): string {
-  return process.env.OVERLEAF_BASE_URL || config.get('baseUrl') || 'https://www.overleaf.com';
+  return process.env.OVERLEAF_BASE_URL || config.get('baseUrl') || 'https://latex.ustc.edu.cn';
 }
 
 export function setBaseUrl(url: string): void {
@@ -71,7 +73,7 @@ export function clearPasswordCredentials(): void {
 }
 
 export function getSessionCookieName(): string {
-  return process.env.OVERLEAF_COOKIE_NAME || config.get('sessionCookieName') || 'overleaf_session2';
+  return process.env.OVERLEAF_COOKIE_NAME || config.get('sessionCookieName') || 'overleaf.sid';
 }
 
 export function setSessionCookieName(name: string): void {
@@ -118,6 +120,28 @@ export function getCsrf(): string | undefined {
 
 export function setCsrf(csrf: string): void {
   config.set('csrf', csrf);
+}
+
+export function getCookieJar(): Record<string, string> | undefined {
+  const sid = config.get('sessionCookie');
+  const lbId = config.get('lbSrvId');
+  if (!sid) return undefined;
+
+  const jar: Record<string, string> = {};
+  const name = getSessionCookieName();
+  jar[name] = sid;
+  if (lbId) jar['lb_srv_id'] = lbId;
+  return jar;
+}
+
+export function setCookieJar(cookies: Record<string, string>): void {
+  const name = getSessionCookieName();
+  if (cookies[name]) {
+    setSessionCookie(cookies[name]);
+  }
+  if (cookies['lb_srv_id']) {
+    config.set('lbSrvId', cookies['lb_srv_id']);
+  }
 }
 
 export function getLastProject(): string | undefined {
