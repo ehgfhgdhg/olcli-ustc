@@ -2,6 +2,198 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.13.0] - 2026-09-11
+
+### Added
+- **`olcli diff --latexdiff` marks the revision up inside the document** ([#55](https://github.com/aloth/olcli/issues/55)) - the follow-up left open when the core `diff` command shipped in 0.10.0. A unified diff is the right artifact for a developer and the wrong one for a thesis advisor, who expects deletions struck through and additions underlined. It runs on the two sides `diff` has already fetched, so the markup describes exactly what the patch output does - struck through is what a push would overwrite, underlined is what it would upload - and costs no extra request
+  - Requires `latexdiff` on PATH, which ships with TeX Live and MacTeX. A missing binary is reported as a setup problem with the install command for the platform, not as a failure of `diff`; nothing else in the command needs an external tool
+  - `\input` and `\include` are inlined before comparing, with `--no-flatten` to opt out. Without it a remote compile resolves those against the files in the project - the *old* content - and produces a PDF marking up the root document while showing every input file as unchanged. Wrong in a way that is very hard to notice
+  - Output goes to `.olcli-diff/`, dotted because `scanLocalFiles` skips dotted entries before any ignore rule is consulted. A plain `main-diff.tex` next to the document would be uploaded to Overleaf by the next `push`
+  - The root document is the `.tex` file declaring `\documentclass`. Several candidates are reported and listed rather than resolved by preferring `main.tex`: marking up the wrong document produces a plausible PDF describing the wrong revision
+  - `--latexdiff-opt` passes options straight through (`--latexdiff-opt --math-markup=0`), since the remote tree is on disk only for the duration of the run and cannot be handed to `latexdiff` by hand afterwards
+- **`--pdf` compiles the marked-up document on Overleaf**, so a reviewable PDF needs no local TeX installation - the reason the flag was proposed in [#45](https://github.com/aloth/olcli/issues/45)
+  - Overleaf's compile endpoint takes a path that must already be in the project; there is no way to compile a document that is not. So the markup is uploaded as `olcli-latexdiff.tex` next to the root document, compiled, downloaded, and removed. That is a real mutation of the project for the duration of one compile, and the command says so before it does it
+  - It refuses rather than overwrites if a file of that name already exists, deletes from a `finally` with nothing in between able to terminate the process first, and prints the exact `olcli rm` command if the delete itself fails or the run is interrupted
+  - Placed next to the root document rather than at the project root, so relative `\includegraphics` and `\bibliography` paths resolve exactly as they do for the document it was built from
+  - A compile failure writes the CLSI log next to the marked-up source instead of reporting only a status, and deletes a PDF left by an earlier run rather than leaving one that describes a different revision. The compile runs against the project, so a `.sty` or `.cls` that exists only locally is the usual cause and the message says so. A missing *figure* is not: Overleaf draws a placeholder box naming the file and still reports success
+- **`src/latexdiff.ts`** - root document detection, argument construction, output naming and failure interpretation are functions over data, unit-tested with no Overleaf account and no `latexdiff` binary. 21 tests, in the suite CI already runs
+- **`olcli diff --exit-code` makes the command a CI gate** ([#48](https://github.com/aloth/olcli/pull/48)) - the second follow-up left open when the core `diff` command shipped in 0.10.0. It reports `diff(1)`'s statuses: `0` when nothing differs, `1` when something does, `2` when the run itself failed
+  - The `1` vs `2` split is the whole feature. A pipeline that cannot separate "the project differs" from "the run failed" reads an expired session cookie as a content change, and a job that goes red for the wrong reason sends whoever reads the log looking for a diff that was never computed. All ten failure paths in the command move to `2` together - bad flag combinations, a missing directory, an unresolvable project, a `latexdiff` that is not installed, a failed remote compile - so no failure can be mistaken for a difference
+  - Failures stay `1` when the flag is absent, which is what every other command exits, so scripts that check `olcli diff` for success are unaffected
+  - The status is *set* rather than exited on. `process.exit` discards whatever is still buffered on a non-TTY stdout, and `olcli diff --exit-code > patch.txt` is exactly a large patch going into a pipe: measured here, exiting outright truncated a 1.5 MB patch to the 128 KB pipe buffer and lost 91% of it mid-hunk. Returning lets node flush first
+  - The gate covers whatever was compared, so `--file` narrows it to one file the way a `git diff --exit-code` pathspec does, and a `--file` matching nothing is `0` rather than an error. Under `--latexdiff` it reports on the project rather than on the markup - a changed figure is a real difference even though a marked-up root document cannot show one
+  - Exit statuses and the "unchanged files are not differences" rule are pinned by unit tests in `test/diff.test.ts`; `test/e2e.sh` gains eight cases covering the clean tree, a difference, `--file` narrowing, the redirected-output case and both failure statuses
+
+### Contributors
+- [@Waynting](https://github.com/Waynting) - `--latexdiff` and `--pdf` ([#56](https://github.com/aloth/olcli/pull/56)), `--exit-code` ([#57](https://github.com/aloth/olcli/pull/57))
+
+## [0.12.0] - 2026-09-06
+
+### Added
+- **`CONTRIBUTING.md`** ([#52](https://github.com/aloth/olcli/pull/52)) - the setup facts that were previously only discoverable by reading the workflow file: `npm ci` rather than `npm install`, the exact Node floor rather than the major, why `test/e2e*.sh` sits outside `npm test`, and how to run the e2e suite against your own project
+  - Records two repository behaviors that look like a broken pull request and are not: CI from a first-time contributor waits at `action_required` until a maintainer approves it, and "Update branch" only appears when the branch merges cleanly
+  - ⚠️ `test/e2e-ignore.sh` and `test/e2e-issue7.sh` have a project ID hardcoded and only run against that one project. Documented rather than changed, since making them configurable is a code change
+- **`docs/ARCHITECTURE.md`** ([#53](https://github.com/aloth/olcli/pull/53)) - why the client looks the way it does. There is no public Overleaf API, so it authenticates as a logged-in browser session and calls the endpoints the web editor's own JavaScript calls
+  - The numbered fallbacks in `extractCsrfToken` and `listProjects` are successive Overleaf redesigns rather than defensive clutter, and `client.ts` now says so at the lines themselves
+  - `uploadFile` replaces whole files rather than sending edit operations, which is why `push` has no merge semantics and why `diff` needed to exist at all
+  - The module map is organized by whether something needs an Overleaf account, since that is the question that decides where new logic goes
+  - Corrects the `client.ts` file header, which claimed to provide programmatic access to Overleaf's REST APIs
+- **`SECURITY.md`** - a private route for credential bugs. Private vulnerability reporting is enabled on the repository, so the file points there first and gives an email address as the fallback. It also records which parts of the credential handling are deliberate: the config directory holds plain JSON by design and `olcli check` prints its path, so only credentials appearing somewhere *else* are a defect
+- **`CITATION.cff`** - makes the package citable through GitHub's own citation control rather than leaving a reader to assemble the fields from `package.json`
+
+### Fixed
+- **`olcli logout` left `.olauth` behind and reported success anyway** ([#50](https://github.com/aloth/olcli/issues/50)) - it cleared the global config and printed `Credentials cleared`, while the `.olauth` file in the current directory survived. That file is consulted *ahead* of the global config, so the user stayed authenticated in that directory - and in `olcli-mcp`, which reads it too. `logout` now clears both and lists what it actually removed
+  - Environment variables cannot be unset by a child process, so `OVERLEAF_SESSION` and `OVERLEAF_EMAIL`/`OVERLEAF_PASSWORD` are now reported instead of ignored. They outrank everything on disk, and a logout that stays silent about them repeats the original mistake in a different place
+- **`olcli auth` claimed `Password login saved.` even under `--no-save-password`** - the same class of bug: a message stating an outcome that did not happen. It now reports what was actually stored
+
+### Changed
+- **The account password is no longer persisted by default** ([#50](https://github.com/aloth/olcli/issues/50)) - it is written only when you ask for it with `--save-password`. The session cookie is stored either way and is what every later command uses; the password only bought an automatic re-login after that cookie expired. A cookie is scoped to olcli and rotates, a password is reusable everywhere and cannot be revoked without changing it
+  - `--no-save-password` still parses and still means "do not save", so existing scripts keep working - it is simply the default now
+  - **Behavior change for self-hosted users:** an expired session no longer re-logs in silently. Re-run `olcli auth`, pass `--save-password` to keep the old behavior, or set `OVERLEAF_EMAIL`/`OVERLEAF_PASSWORD`
+- **`olcli auth --password` is now optional and prompts instead** ([#50](https://github.com/aloth/olcli/issues/50)) - passing it puts the password in shell history, so `olcli auth --email you@example.com` now reads it from the terminal without echoing. The flag still works and warns; with no terminal available, the error names `OVERLEAF_EMAIL`/`OVERLEAF_PASSWORD`, which every command already reads
+  - Keystroke handling is a pure reducer so it can be tested without a pty. Driving the real prompt over one is what surfaced the bug it now guards: filtering only the ESC of an arrow key left the printable `[` and `A` behind and silently appended them to the password
+- **`olcli check` now reports whether a password is stored** and whether a `.olauth` file is present, never the values. Answering "is my password on disk?" previously meant opening the config file
+
+### Internal
+- CI status badge in the README, reporting what `ci.yml` has been running since 0.10.0
+- Spelling normalized to American English across the changelog and `docs/ARCHITECTURE.md`: `behaviour`, `organised`, `colourized`, `normalisation`. Identifiers in `src/` are untouched - `colourizeDiffLine` and the `colour` locals are code, and renaming them belongs in a change that touches that code anyway
+- `CONTRIBUTING.md` now states the spelling rule rather than leaving it to be discovered in review, and names `CITATION.cff` as the third place a release bumps alongside `package.json` and `package-lock.json`. It is the one with no test behind it
+
+### Contributors
+- [@Waynting](https://github.com/Waynting) - credential handling ([#51](https://github.com/aloth/olcli/pull/51)), `CONTRIBUTING.md` ([#52](https://github.com/aloth/olcli/pull/52)), `docs/ARCHITECTURE.md` ([#53](https://github.com/aloth/olcli/pull/53))
+
+## [0.11.0] - 2026-09-04
+
+### Added
+- **`olcli project create <name>`** ([#47](https://github.com/aloth/olcli/pull/47)) - create a blank or example Overleaf project from the command line
+  - `--template blank|example` picks an empty project or Overleaf's example document, `--json` prints the created project for scripting
+  - The new project becomes the remembered project, so a following `pull` or `push` needs no argument
+  - `OverleafClient.createProject()` exposes the same thing through the programmatic API, with `ProjectTemplate`, `CreateProjectOptions` and `CreatedProject` exported from the package root
+  - Tested against a local HTTP server that captures the outgoing request, so request construction, response mapping, validation and failure paths are covered without an Overleaf account
+- **`create_project` MCP tool** - the same thing for AI assistants, so one asked to start a new paper does not have to shell out to the CLI
+  - Applies rather than previews, unlike `plan_project_renames`. That one is plan-only because a bulk rename across an account is unrecoverable; creating is additive, touches nothing existing, and an unwanted project can be deleted afterwards
+  - Returns the created project plus the template used, so a caller can tell a blank project from an example one without asking again
+  - Registration verified over a real MCP handshake: `tools/list` returns 19 tools including `create_project`
+
+### Fixed
+- **The documented global config path was wrong on macOS.** The README named `~/.config/olcli-nodejs/config.json`, but `conf` resolves to `~/Library/Preferences/olcli-nodejs/config.json` there. The path is platform-dependent and is no longer hardcoded in the docs; `olcli check` and `olcli auth` both print the real one
+
+### Contributors
+- [@mohamedsobhi777](https://github.com/mohamedsobhi777) - `olcli project create` ([#47](https://github.com/aloth/olcli/pull/47))
+
+## [0.10.0] - 2026-09-03
+
+### Added
+- **`diff_project` MCP tool** - the MCP counterpart of `olcli diff`, so an assistant can preview what a push would change without shelling out to the CLI. Read-only: nothing is uploaded or written
+  - Returns one entry per changed file with `path`, `status`, `binary` and a unified `patch`, rather than one block of diff text. The other 17 tools return JSON and an agent should be able to filter by status without parsing output
+  - `name_only` drops the patch text, `file` restricts to one path, `context` sets hunk width, and both ignore switches mirror the CLI flags
+  - Same semantics as the command: the remote is fetched fresh on every call and `remote_fetched_at` is part of the response, because a collaborator editing between the call and a later push can still change the outcome
+  - Registration verified over a real MCP handshake rather than by reading the source: `tools/list` returns 18 tools including `diff_project`, with `project_id` and `local_dir` required
+- **`olcli diff [project] [dir]`** ([#45](https://github.com/aloth/olcli/issues/45)) - content-level preview of what a push would change
+  - `push --dry-run` answers *which files*; there was no way to see *what changed inside them* short of pulling into a scratch directory and running `diff(1)` by hand
+  - Unified diff to stdout, colorized when stdout is a TTY. `--name-only` for paths only, `--file <path>` for a single file, `-U <n>` for context width
+  - **The remote side is fetched fresh on every run**, and the command says so in `--help` and in its output footer. `.olcli.json` records remote *paths*, never remote *contents*, so there is no stored snapshot to compare against - "diff against the last pull" would have meant inventing a content cache, not reusing one. Fetching fresh is also what makes the diff describe what a subsequent `push` will overwrite, which is the question the command exists to answer
+  - Cost of fetching fresh is one request: `downloadProject` returns the whole project as a single archive, the same call `pull` and `sync` already make. Per-file fetching would have been one request per file and still could not have identified which files differ without downloading them
+  - `a/` is the remote and `b/` is local, so a `+` line is content `push` would upload and a `-` line is content it would overwrite
+  - Binary files (PDFs, images) are reported as `Binary files ... differ`, detected by a NUL byte in the first 8000 bytes. No attempt is made to be cleverer
+  - Both sides pass through the same ignore layers and the same dotfile rule. Filtering only the local side would have listed `output.pdf` and every stray `.aux` on Overleaf as a local deletion on every run
+  - Remote-only files are reported but flagged as untouched by a plain `push`, since only `push --delete` removes them
+  - Archive entries whose names escape the target directory are dropped, consistent with what `pull` refuses to extract
+- **Continuous integration for pull requests**
+  - The repository had no CI for pull requests. Only `publish.yml` existed, triggered by tags, so a change was first executed by a machine other than the author's at release time
+  - `.github/workflows/ci.yml` runs `npm ci`, lint, build and test on pull requests and on pushes to `main`, across Node 20.18.1 and 24
+  - A final step verifies `dist/cli.js`, `dist/mcp.js`, `dist/remote-helper.js` and `dist/index.js` are non-empty and that `node dist/cli.js --version` runs. `tsc` exiting zero does not prove entry points were emitted, and this is the step that caught the Node 18 breakage above on its first run
+  - `test/e2e*.sh` are deliberately excluded: they drive a real Overleaf account
+- **A working `npm run lint`** ([#46](https://github.com/aloth/olcli/issues/46)). The script had been defined since the initial release with no `eslint` in `devDependencies` and no configuration, so it failed on every clean install. Adds `eslint` 9 with `typescript-eslint`, flat config, no type-checked rules
+  - `no-explicit-any` is a warning rather than an error. 58 pre-existing occurrences sit where untyped JSON comes back from Overleaf, which publishes no schema for those responses. As an error, CI would be red on `main` from the day it was switched on
+
+### Changed
+- Local file scanning extracted into `src/scan.ts`. `push` and `sync` each carried their own copy of the same walk-and-filter loop and the two had already drifted (`sync` guarded against a missing directory, `push` did not); `diff` would have made a third. Same reasoning as `src/rename-plan.ts` in 0.9.0
+- `push --dry-run` now notes that its list is selected by modification time and points at `olcli diff` for content changes. The two commands answer different questions and will disagree - a file touched but not edited appears in `push --dry-run` and not in `diff` - so the overlap is resolved by making each one say what it measures rather than by merging them
+
+### Fixed
+- **`engines` claimed Node 18 support that did not exist.** olcli would not start at all on Node 18: `client.ts` imports `cheerio` at module load, `cheerio@1.2.0` depends on `undici@7.x`, and undici references `File` as a global, which Node only exposes from 20 onwards. The process died with `ReferenceError: File is not defined` before printing anything, including `--version`
+  - Published 0.9.1 declared `engines: { node: ">=18" }` while its own lockfile resolved `cheerio 1.2.0` and `undici 7.20.0`, both declaring `>=20.18.1`. The manifest and the dependency tree contradicted each other
+  - `engines` is now `>=20.18.1`, the exact floor every `undici` release in the `^7.19.0` range requires. Not `>=20`: the floor is a patch version, and rounding it down would restate the same kind of claim this release is fixing
+  - Node 18 reached end of life on 2025-04-30. Pinning `cheerio` back to `~1.1.0` to keep it was considered and rejected: it freezes a dependency that would need manual attention on every future update, and its `undici@^7.10.0` range was never measured to actually work on 18
+  - Verified against real Node 20.18.1 and 20.20.2 binaries, not against a version string: `npm ci`, lint, build, tests and `node dist/cli.js --version` all pass, and `dist/client.js` imports without error
+
+### Internal
+- Removed dead code the new lint setup surfaced: `printFolder` in `cli.ts`, unreachable since the initial 0.1.0 release and only ever calling itself; five imports that were pulled in and never referenced; twelve `catch (e)` clauses that never read the binding; three `let` bindings never reassigned. No behavior change
+- `docs/MCP.md` and `SKILL.md` listed 15 and 17 MCP tools against 18 registered. `rename_project` and `plan_project_renames` had been missing since they were added; both files are now checked against the registrations rather than maintained by hand
+
+### Notes
+- New runtime dependency: [`diff`](https://www.npmjs.com/package/diff) `^9.0.0`, which has no dependencies of its own
+- Comparison, rendering and remote-tree filtering live in `src/diff.ts` as pure functions, so they are unit-tested without an Overleaf account (`npm test`). Like `rename-plan.ts`, they are not re-exported from the package root
+- `latexdiff` integration (`--latexdiff`, `--pdf`) is deliberately left out of this change and will follow separately
+
+### Contributors
+- [@Waynting](https://github.com/Waynting) - `olcli diff` ([#48](https://github.com/aloth/olcli/pull/48))
+
+## [0.9.1] - 2026-09-01
+
+### Fixed
+- **Zip-slip path traversal when extracting project archives** ([#44](https://github.com/aloth/olcli/pull/44), reported and fixed by [@Waynting](https://github.com/Waynting))
+  - `pull` and `sync` joined each archive entry name onto the target directory with no validation, so an entry named `../../../../home/user/.bashrc` would be written outside the project directory
+  - adm-zip's own `extractAllTo()` guards against this, but olcli extracts manually via `entry.getData()` and `writeFileSync()`, which bypasses it
+  - This matters because olcli supports self-hosted Overleaf and ShareLaTeX instances, so the archive does not always come from a server the user controls or trusts
+  - New `resolveWithin(baseDir, relativePath)` in `src/paths.ts` resolves a candidate path against the base directory and returns `null` unless the result is strictly inside it. Rejects `..` escapes, absolute paths, Windows drive letters, the base directory itself, and sibling-prefix cases where `/tmp/project-evil` string-prefixes `/tmp/project`
+  - `pull` skips unsafe entries with a warning and excludes them from the `remoteManifest` written to `.olcli.json`, so they cannot enter deletion propagation on a later sync
+  - `sync` filters them when building its remote file map and re-checks in the write loop
+  - Well-formed archives are unaffected: safe entry names resolve to exactly the paths they did before
+
+### Added
+- `npm test` script running `test/paths.test.ts` via `node:test` and the existing `tsx` dev dependency. `publish.yml` already called `npm test --if-present`, which was a no-op until now, so this turns it into a real gate before publish. No new dependencies
+
+## [0.9.0] - 2026-08-24
+
+### Added
+- **`olcli push --delete`** - opt-in propagation of local deletions to the remote
+  - `push` has never removed remote files, so a file deleted locally stayed on Overleaf indefinitely. `sync` already handles this ([#7](https://github.com/aloth/olcli/issues/7)), but `sync` pulls the remote over the working tree first, which is not acceptable when the local tree is the source of truth
+  - Deletion candidates come from `pushManifest` in `.olcli.json` (what this directory last uploaded), **never** from the remote listing - files uploaded by collaborators through the web editor are left alone
+  - Skipped entirely when no baseline manifest exists (first push from a directory), since "deleted locally" and "never existed here" cannot be told apart
+  - Deletions run *after* uploads, so a rename never leaves the remote without the file
+  - Opt-in: default `push` behavior is unchanged
+- **`olcli project rename <newname> [project]`** - rename the project itself
+  - `olcli rename` targets a doc/file/folder *inside* a project; there was no way to rename the project
+  - `--dry-run` prints the change without applying it
+  - Renaming to the current name is a no-op with an info message, not an error
+- **`olcli project rename-bulk`** - pattern-based rename across many projects
+  - Filters with `--match <regex>`, transforms with `--search`/`--replace`, `--prefix`, `--suffix`
+  - **Dry-run is the default.** `--apply` is required to change anything - inverted from the usual convention because Overleaf keeps no project-name history, so a bulk rename fired on a typo cannot be undone
+  - `--max <n>` refuses to apply when more than `n` projects would change
+  - **Collision detection**: refuses to apply when two projects would end up with the same name, or when a target name is already taken by an untouched project. Overleaf tolerates duplicate names, so without this check the operation would succeed silently and leave projects that cannot be told apart in any listing
+  - A failure mid-run is reported and the remaining renames continue; a partial run is recoverable by re-running, aborting midway would leave the same partial state with no report
+- **MCP tool `rename_project`** - rename a project through the MCP surface
+- **MCP tool `plan_project_renames`** - preview a bulk rename; returns planned renames, skipped projects and collisions
+  - Deliberately plan-only. There is no apply counterpart on the MCP surface: an account-wide rename is unrecoverable, so applying a plan requires a human running `olcli project rename-bulk --apply`
+
+### Changed
+- Rename planning logic extracted into `src/rename-plan.ts` as a pure function, so the CLI and the MCP server evaluate the same rules. Two copies would drift, and the collision check is the part that must not
+
+### Notes
+- `.olcli.json` gains an optional `pushManifest` field. Older versions ignore unknown fields, so downgrading is safe. When no `pushManifest` exists, `push --delete` falls back to the `remoteManifest` written by `pull`
+
+## [0.8.0] - 2026-08-08
+
+### Added
+- **Compile a specific `.tex` file as the root document** ([#38](https://github.com/aloth/olcli/pull/38)) - contributed by [@SomeBottle](https://github.com/SomeBottle)
+  - New `-r, --resource <path>` option on `compile`, `pdf`, and `output`
+  - Sets `rootResourcePath` on the Overleaf compile endpoint, so multi-document projects can build `appendix.tex`, a checklist document, or any other file independently
+  - Useful for pulling a per-document `.bbl` when preparing arXiv bundles
+  - MCP tools `compile`, `download_pdf`, and `compile_with_outputs` accept an optional `resource_path`
+  - Clearer error when a compile fails and a resource path was given, hinting that the file may not exist in the project
+  - E2E coverage for compile, PDF download, output listing, and log download with `--resource`
+- **`--to <path>` option on `olcli upload`** ([#40](https://github.com/aloth/olcli/pull/40), closes [#39](https://github.com/aloth/olcli/issues/39)) to state the remote destination explicitly
+
+### Fixed
+- **Absolute paths passed to `olcli upload` no longer mirror the local directory structure into the project** ([#39](https://github.com/aloth/olcli/issues/39)) - reported by [@SomeBottle](https://github.com/SomeBottle) while working on #38
+  - `/tmp/tmp.abc123/paper.tex` previously uploaded to `tmp/tmp.abc123/paper.tex`; it now lands in the project root as `paper.tex`
+  - Relative paths are unchanged, so `figures/diagram.png` still lands in the `figures` folder
+  - `.` and `..` segments are normalized, and paths that would escape the project root are collapsed rather than passed through
+  - MCP `push_file` uses the same resolution for `remote_path`, so CLI and MCP agree
+  - Path logic extracted into `src/paths.ts`
+
 ## [0.7.0] - 2026-07-02
 
 ### Added

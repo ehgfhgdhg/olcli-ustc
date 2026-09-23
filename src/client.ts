@@ -1,8 +1,18 @@
 /**
- * Overleaf API Client
+ * Overleaf client
  *
- * Provides programmatic access to Overleaf's REST APIs for project
- * management, file operations, and LaTeX compilation.
+ * Project management, file operations and LaTeX compilation against an
+ * Overleaf instance.
+ *
+ * These are not Overleaf's public APIs - there are none for the free tier.
+ * This client authenticates as a logged-in browser session and calls the same
+ * endpoints the web editor's own JavaScript calls: a session cookie plus a
+ * CSRF token scraped from the page, project data parsed out of `ol-*` meta
+ * tags, and the file tree recovered over the collaboration socket. Nothing
+ * here is versioned or documented by Overleaf, so the layered fallbacks below
+ * are not defensive habit - each one is a redesign that already happened.
+ *
+ * Read docs/ARCHITECTURE.md before changing anything in this file.
  */
 
 import * as cheerio from 'cheerio';
@@ -18,6 +28,7 @@ const pkg = JSON.parse(readFileSync(join(__dirname, '..', 'package.json'), 'utf-
 const USER_AGENT = `olcli/${pkg.version}`;
 
 const DEFAULT_BASE_URL = 'https://latex.ustc.edu.cn';
+const RESOURCE_PATH_FAILURE_HINT = ' (Perhaps the resource file you specified does not exist in the project?)';
 
 export interface Project {
   id: string;
@@ -34,6 +45,19 @@ export interface ProjectInfo {
   name: string;
   rootDoc_id?: string;
   rootFolder: FolderEntry[];
+}
+
+export type ProjectTemplate = 'blank' | 'example';
+
+export interface CreateProjectOptions {
+  template?: ProjectTemplate;
+}
+
+export interface CreatedProject {
+  id: string;
+  name: string;
+  url: string;
+  ownerId?: string;
 }
 
 export interface FolderEntry {
@@ -243,6 +267,20 @@ export class OverleafClient {
   }
 
   /**
+   * Build the request body for the compile endpoint.
+   * Support an optional resourcePath to compile a specific file.
+   */
+  private buildCompileRequestBody(resourcePath?: string): string {
+    return JSON.stringify({
+      rootDoc_id: null,
+      draft: false,
+      check: 'silent',
+      incrementalCompilesEnabled: true,
+      ...(resourcePath ? { rootResourcePath: resourcePath } : {})
+    });
+  }
+
+  /**
    * Create client from session cookie string
    */
   static async fromSessionCookie(
@@ -423,6 +461,22 @@ export class OverleafClient {
     };
   }
 
+  /**
+   * Pull the CSRF token out of a rendered Overleaf page.
+   *
+   * Overleaf requires this on every state-changing request, which is what
+   * stops another site from using your session cookie against it. It is not a
+   * secret - the web editor needs it in the page to make its own requests - so
+   * reading it back out of the HTML is the intended way for a session to
+   * obtain one. See docs/ARCHITECTURE.md.
+   *
+   * The three lookups are not belt-and-braces. Each is where the token lived
+   * at some point: the `ol-csrfToken` meta tag is current, the hidden form
+   * input is what older releases shipped, and the inline-script scrape catches
+   * self-hosted instances older still. Removing the later ones breaks
+   * self-hosted users without breaking anything on overleaf.com, so the
+   * failure would not show up here.
+   */
   private static extractCsrfToken($: cheerio.CheerioAPI): string | undefined {
     let csrf = $('meta[name="ol-csrfToken"]').attr('content');
     if (!csrf) {
@@ -481,7 +535,7 @@ export class OverleafClient {
     for (const setCookieHeader of setCookie) {
       const match = setCookieHeader.match(/^([^=]+)=([^;]+)/);
       if (match) {
-        let value = match[2];
+        const value = match[2];
         let decoded = value;
         try {
           decoded = decodeURIComponent(value);
@@ -500,7 +554,6 @@ export class OverleafClient {
 
   private logVerbose(...args: any[]): void {
     if (this.verbose) {
-      // eslint-disable-next-line no-console
       console.error('[olcli]', ...args);
     }
   }
@@ -522,7 +575,7 @@ export class OverleafClient {
     // built-in Web Fetch primitives. Keeps every code path on httpRequest
     // (no fetch() reintroduction) while properly serializing multipart uploads.
     let bodyBuffer: string | Buffer | undefined;
-    let extraHeaders: Record<string, string> = {};
+    const extraHeaders: Record<string, string> = {};
     if (options.body instanceof FormData) {
       const req = new Request('http://x/', { method: 'POST', body: options.body });
       const arrayBuf = await req.arrayBuffer();
@@ -562,7 +615,7 @@ export class OverleafClient {
             } else if (expect === 'json') {
               try {
                 body = JSON.parse(buffer.toString('utf-8'));
-              } catch (e) {
+              } catch {
                 this.logVerbose(`${method} ${reqUrl} -> ${status} (invalid JSON, ${buffer.length} bytes)`);
                 return reject(new Error(`Failed to parse JSON response from ${reqUrl}`));
               }
@@ -619,7 +672,11 @@ export class OverleafClient {
     const html = response.body as string;
     const $ = cheerio.load(html);
 
-    // Try new Overleaf structure first (PR #82)
+    // There is no projects API; the list is server-rendered into a meta tag,
+    // so this parses Overleaf's own HTML. The three methods below are three
+    // successive shapes that tag has had - newest first, oldest last. A
+    // self-hosted instance can be running any of them, which is why the older
+    // ones stay. See docs/ARCHITECTURE.md.
     let projectsData: any[] = [];
 
     // Method 1: ol-prefetchedProjectsBlob (newest Overleaf)
@@ -628,7 +685,7 @@ export class OverleafClient {
       try {
         const data = JSON.parse(prefetchedBlob);
         projectsData = data.projects || data;
-      } catch (e) {
+      } catch {
         // Try next method
       }
     }
@@ -645,7 +702,7 @@ export class OverleafClient {
               projectsData = data.projects;
               break;
             }
-          } catch (e) {
+          } catch {
             // Continue
           }
         }
@@ -658,7 +715,7 @@ export class OverleafClient {
       if (projectsMeta) {
         try {
           projectsData = JSON.parse(projectsMeta);
-        } catch (e) {
+        } catch {
           // Continue
         }
       }
@@ -695,6 +752,49 @@ export class OverleafClient {
   }
 
   /**
+   * Create a blank or example project.
+   */
+  async createProject(name: string, options: CreateProjectOptions = {}): Promise<CreatedProject> {
+    const trimmed = name.trim();
+    if (!trimmed) {
+      throw new Error('Project name must not be empty');
+    }
+
+    const template = options.template ?? 'blank';
+    if (template !== 'blank' && template !== 'example') {
+      throw new Error(`Unsupported project template: ${template}`);
+    }
+
+    const response = await this.httpRequest(`${this.baseUrl}/project/new`, {
+      method: 'POST',
+      headers: this.getHeaders(true),
+      body: JSON.stringify({
+        projectName: trimmed,
+        ...(template === 'example' ? { template } : {})
+      }),
+      expect: 'json'
+    });
+
+    if (!response.ok) {
+      throw new Error(`Failed to create project: ${response.status}`);
+    }
+
+    this.applySetCookieHeaders(response.headers['set-cookie'] as string[] | undefined);
+
+    const projectId = response.body?.project_id;
+    if (typeof projectId !== 'string' || !projectId) {
+      throw new Error('Failed to create project: response did not include a project ID');
+    }
+
+    return {
+      id: projectId,
+      name: trimmed,
+      url: `${this.baseUrl}/project/${projectId}`,
+      ...(typeof response.body?.owner_ref === 'string' ? { ownerId: response.body.owner_ref } : {})
+    };
+  }
+
+  /**
    * Get detailed project info including file tree
    */
   async getProjectInfo(projectId: string): Promise<ProjectInfo> {
@@ -720,7 +820,7 @@ export class OverleafClient {
     if (projectMeta) {
       try {
         projectInfo = JSON.parse(projectMeta);
-      } catch (e) {
+      } catch {
         // Continue
       }
     }
@@ -734,7 +834,7 @@ export class OverleafClient {
           try {
             projectInfo = JSON.parse(content);
             break;
-          } catch (e) {
+          } catch {
             // Continue
           }
         }
@@ -762,6 +862,17 @@ export class OverleafClient {
    * Fetch the full project object via the collaboration socket.
    * Returns the `project` field of the joinProjectResponse, which contains
    * the rootFolder tree and other metadata that used to live in ol-project.
+   *
+   * This is a hand-written Socket.IO 0.9 client: handshake for a session id,
+   * `xhr-polling` for packets, decode the frames, answer the `2::` heartbeats,
+   * disconnect with `0::`. No library - the protocol is old enough that
+   * depending on one to speak it would cost more than the forty lines below.
+   *
+   * It is the most fragile surface in the repository and the least obvious,
+   * because it reimplements an undocumented internal protocol rather than
+   * calling an endpoint. It exists because the file tree left the meta tags
+   * and this payload is where it went; there is no HTTP route that returns it.
+   * When the tree is what broke, suspect this method first.
    */
   private async getProjectFromSocket(projectId: string): Promise<any | null> {
     let sid: string | null = null;
@@ -875,16 +986,11 @@ export class OverleafClient {
   /**
    * Compile project and get PDF
    */
-  async compileProject(projectId: string): Promise<{ pdfUrl: string; logs: string[] }> {
+  async compileProject(projectId: string, resourcePath?: string): Promise<{ pdfUrl: string; logs: string[] }> {
     const response = await this.httpRequest(this.compileUrl(projectId), {
       method: 'POST',
       headers: this.getHeaders(true),
-      body: JSON.stringify({
-        rootDoc_id: null,
-        draft: false,
-        check: 'silent',
-        incrementalCompilesEnabled: true
-      }),
+      body: this.buildCompileRequestBody(resourcePath),
       expect: 'json'
     });
 
@@ -897,7 +1003,7 @@ export class OverleafClient {
     const data = response.body as any;
 
     if (data.status !== 'success') {
-      throw new Error(`Compilation failed: ${data.status}`);
+      throw new Error(`Compilation failed: ${data.status}${resourcePath ? RESOURCE_PATH_FAILURE_HINT : ''}`);
     }
 
     // Match by path 'output.pdf' — Overleaf's CLSI always names the main
@@ -921,8 +1027,8 @@ export class OverleafClient {
   /**
    * Download compiled PDF
    */
-  async downloadPdf(projectId: string, timeoutMs?: number): Promise<Buffer> {
-    const { pdfUrl } = await this.compileProject(projectId);
+  async downloadPdf(projectId: string, timeoutMs?: number, resourcePath?: string): Promise<Buffer> {
+    const { pdfUrl } = await this.compileProject(projectId, resourcePath);
     return this.downloadBuffer(pdfUrl, timeoutMs);
   }
 
@@ -1552,7 +1658,7 @@ export class OverleafClient {
       if (projectInfo.rootFolder?.[0]?._id) {
         return projectInfo.rootFolder[0]._id;
       }
-    } catch (e) {
+    } catch {
       // Fall through to computed method
     }
 
@@ -1623,12 +1729,12 @@ export class OverleafClient {
           // Success! Delete the probe file and return this folder ID
           try {
             await this.deleteEntity(projectId, data.entity_id, 'doc');
-          } catch (e) {
+          } catch {
             // Ignore delete errors for probe file
           }
           return folderId;
         }
-      } catch (e) {
+      } catch {
         // Continue to next candidate
       }
     }
@@ -1640,6 +1746,22 @@ export class OverleafClient {
    * Upload a file to a project.
    * If folderTree is provided and fileName contains a path (e.g. 'figures/img.png'),
    * the file will be uploaded into the correct subfolder, creating it if needed.
+   */
+  /**
+   * Upload a file, replacing any file of the same name.
+   *
+   * This **overwrites**; it does not edit. Typing in the Overleaf editor sends
+   * character-level operations over the collaboration socket, and those merge
+   * with concurrent edits. This posts a whole file to the upload endpoint -
+   * the same thing as dragging a same-named file into the web UI - so whatever
+   * was there is gone.
+   *
+   * That is why `push` has no merge semantics and cannot grow any: there is no
+   * three-way merge available, only a file replacing a file. It is also why
+   * `olcli diff` exists, and why it fetches the remote fresh rather than
+   * comparing against the last pull - previewing what a push will overwrite is
+   * the only thing standing between a collaborator's edit and its replacement.
+   * See docs/ARCHITECTURE.md.
    */
   async uploadFile(
     projectId: string,
@@ -1709,7 +1831,7 @@ export class OverleafClient {
           if (data?.error === 'folder_not_found') {
             return { success: false, error: 'folder_not_found' };
           }
-        } catch (e) {
+        } catch {
           // Ignore non-JSON responses and return generic HTTP error below.
         }
         return { success: false, error: `${response.status} - ${text}` };
@@ -1899,6 +2021,33 @@ export class OverleafClient {
   }
 
   /**
+   * Rename the project itself (not an entity inside it).
+   *
+   * Distinct from renameEntity, which targets a doc/file/folder within a
+   * project. Overleaf exposes the project-level rename under a different
+   * path and expects `newProjectName` rather than `name`.
+   */
+  async renameProject(projectId: string, newName: string): Promise<void> {
+    const trimmed = newName.trim();
+    if (!trimmed) {
+      throw new Error('Project name must not be empty');
+    }
+
+    const response = await this.httpRequest(`${this.baseUrl}/project/${projectId}/rename`, {
+      method: 'POST',
+      headers: this.getHeaders(true),
+      body: JSON.stringify({ newProjectName: trimmed }),
+      expect: 'text'
+    });
+
+    if (!response.ok) {
+      throw new Error(`Failed to rename project: ${response.status}`);
+    }
+
+    this.applySetCookieHeaders(response.headers['set-cookie'] as string[] | undefined);
+  }
+
+  /**
    * Delete a file by path
    */
   async deleteByPath(projectId: string, path: string): Promise<void> {
@@ -1943,7 +2092,7 @@ export class OverleafClient {
       if (entity && entity.type !== 'folder') {
         return await this.downloadFile(projectId, entity.id, entity.type);
       }
-    } catch (e) {
+    } catch {
       // Fall through to zip method
     }
 
@@ -2242,20 +2391,17 @@ export class OverleafClient {
   /**
    * Compile project and get all output files
    */
-  async compileWithOutputs(projectId: string): Promise<{
+  async compileWithOutputs(projectId: string, resourcePath?: string): Promise<{
     status: 'success' | 'failure' | 'error';
     pdfUrl?: string;
     outputFiles: { path: string; type: string; url: string }[];
+    /** Set when compilation failed and a specific root document was requested. */
+    failureHint?: string;
   }> {
     const response = await this.httpRequest(this.compileUrl(projectId), {
       method: 'POST',
       headers: this.getHeaders(true),
-      body: JSON.stringify({
-        rootDoc_id: null,
-        draft: false,
-        check: 'silent',
-        incrementalCompilesEnabled: true
-      }),
+      body: this.buildCompileRequestBody(resourcePath),
       expect: 'json'
     });
 
@@ -2281,7 +2427,8 @@ export class OverleafClient {
         path: f.path,
         type: f.type,
         url: `${this.baseUrl}${f.url}${qs}`
-      }))
+      })),
+      failureHint: data.status !== 'success' && resourcePath ? RESOURCE_PATH_FAILURE_HINT : undefined
     };
   }
 

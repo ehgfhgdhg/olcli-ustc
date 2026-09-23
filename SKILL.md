@@ -60,6 +60,15 @@ Clear stored credentials:
 olcli logout
 ```
 
+Clears the global config and the `.olauth` file in the current directory, and
+reports each. Environment variables cannot be unset by a child process, so
+`OVERLEAF_SESSION` and `OVERLEAF_EMAIL`/`OVERLEAF_PASSWORD` are reported rather
+than silently ignored — they outrank anything on disk.
+
+For unattended use, prefer `OVERLEAF_EMAIL`/`OVERLEAF_PASSWORD` over
+`olcli auth --password`: every command reads them, and nothing is written to
+disk or to shell history.
+
 ### Self-hosted Overleaf
 
 ```bash
@@ -109,7 +118,11 @@ olcli-mcp
 npx @aloth/olcli-mcp
 ```
 
-Available MCP tools: `list_projects`, `get_project_info`, `pull_project`, `push_file`, `compile`, `download_pdf`, `list_comments`, `get_entities`, `download_file`, `add_comment`, `reply_to_comment`, `resolve_comment`, `delete_entity`, `rename_entity`, `compile_with_outputs`.
+Available MCP tools: `list_projects`, `get_project_info`, `pull_project`, `push_file`, `compile`, `download_pdf`, `list_comments`, `get_entities`, `download_file`, `add_comment`, `reply_to_comment`, `resolve_comment`, `delete_entity`, `rename_entity`, `rename_project`, `plan_project_renames`, `compile_with_outputs`, `diff_project`, `create_project`.
+
+`compile`, `download_pdf` and `compile_with_outputs` accept an optional `resource_path` to compile a specific root document.
+
+`diff_project` is the MCP counterpart of `olcli diff`: read-only, fetches the remote fresh on every call, and returns one entry per changed file with `path`, `status`, `binary` and a unified `patch`. Pass `name_only` to drop the patch text. `plan_project_renames` previews bulk renames and never applies them.
 
 Auth: set `OVERLEAF_SESSION` env var in MCP config, or use stored credentials from `olcli auth`.
 
@@ -122,6 +135,13 @@ olcli pull "My Paper"
 cd My_Paper/
 ```
 
+### Create a project
+
+```bash
+olcli project create "My Paper"
+olcli project create "Example Paper" --template example
+```
+
 ### Edit and sync changes
 
 ```bash
@@ -130,6 +150,25 @@ olcli push              # Upload changes only
 olcli sync              # Bidirectional sync (pull + push, propagates local deletions)
 olcli sync --no-delete  # Sync without propagating local deletions to remote
 ```
+
+### Review changes before pushing
+
+```bash
+olcli diff                 # unified diff of every changed file
+olcli diff --name-only     # changed paths only
+olcli diff --file main.tex # a single file
+olcli diff --exit-code     # CI gate: 0 same, 1 differs, 2 failed
+```
+
+The remote side is fetched fresh each run, so this shows what a subsequent
+`push` would overwrite — not a comparison against the last `pull`. `a/` is the
+remote, `b/` is local. Binary files are reported as differing without a patch.
+
+`--exit-code` uses `diff(1)`'s statuses so the command can gate a pipeline:
+`0` nothing differs, `1` something does, `2` the run itself failed. The last
+one matters — without it a job cannot tell a changed file from an expired
+session. Failures stay `1` when the flag is absent, so existing scripts are
+unaffected.
 
 ### Delete or rename remote files
 
@@ -153,14 +192,19 @@ olcli sync --no-ignore     # escape hatch: upload everything
 ```bash
 olcli pdf                      # Compile and download
 olcli pdf -o paper.pdf         # Custom output name
+olcli pdf -r chapters/intro.tex  # Compile a specific root document
 olcli compile                  # Just compile (no download)
+olcli compile -r appendix.tex  # Compile a specific root document without downloading
 ```
+
+`-r, --resource <path>` works on `compile`, `pdf`, and `output`: it compiles the given `.tex` file as the root document. Useful when a project contains several documents.  
 
 ### Download .bbl for arXiv submission
 
 ```bash
 olcli output bbl               # Download compiled .bbl
 olcli output bbl -o main.bbl   # Custom filename
+olcli output bbl -r appendix.tex
 olcli output --list            # List all available outputs
 ```
 
@@ -169,7 +213,13 @@ olcli output --list            # List all available outputs
 ```bash
 olcli upload figure1.png "My Paper"          # Upload to project root
 olcli upload diagram.pdf                      # Auto-detect project from .olcli.json
+olcli upload figures/diagram.png              # Relative path is preserved remotely
+olcli upload /tmp/build/diagram.png           # Absolute path lands in the project root
+olcli upload /tmp/build/diagram.png --to figures/diagram.png   # Explicit destination
 ```
+
+Remote path rules: a relative local path keeps its directory part, an absolute
+local path collapses to its basename, and `--to` overrides both.
 
 ### Download specific files
 
@@ -221,16 +271,18 @@ zip arxiv.zip *.tex main.bbl figures/*.pdf
 | Command | Description |
 |---------|-------------|
 | `olcli auth --cookie <value>` | Authenticate with session cookie |
-| `olcli auth --email <e> --password <p>` | Authenticate with password (self-hosted) |
+| `olcli auth --email <e>` | Authenticate with password, prompted (self-hosted) |
 | `olcli whoami` | Check authentication status |
-| `olcli logout` | Clear stored credentials |
+| `olcli logout` | Clear the global config and the local `.olauth` |
 | `olcli check` | Show config paths and credential sources |
 | `olcli list` | List all projects |
+| `olcli project create <name>` | Create a blank or example project |
 | `olcli info [project]` | Show project details |
 | `olcli pull [project] [dir]` | Download project files |
 | `olcli push [dir]` | Upload local changes |
 | `olcli sync [dir]` | Bidirectional sync |
-| `olcli upload <file> [project]` | Upload a single file |
+| `olcli diff [project] [dir]` | Content-level diff of local files vs. the live remote |
+| `olcli upload <file> [project]` | Upload a single file (`--to <path>` sets the remote destination) |
 | `olcli download <file> [project]` | Download a single file |
 | `olcli delete <file> [project]` | Delete a remote file or folder (alias: `rm`) |
 | `olcli rename <old> <new> [project]` | Rename a remote file or folder (alias: `mv`) |
@@ -246,13 +298,20 @@ zip arxiv.zip *.tex main.bbl figures/*.pdf
 | `olcli comments reopen <id>` | Reopen a thread |
 | `olcli comments delete <id>` | Delete a thread |
 | `olcli config set-url <url>` | Set self-hosted base URL |
+| `olcli config get-url` | Show the configured base URL |
 | `olcli config set-cookie-name <name>` | Set cookie name |
+| `olcli config get-cookie-name` | Show the configured cookie name |
 | `olcli config set-timeout <ms>` | Set HTTP timeout |
+| `olcli config get-timeout` | Show the configured HTTP timeout |
+| `olcli project rename <old> <new>` | Rename a project |
+| `olcli project rename-bulk` | Rename many projects by pattern (dry-run unless `--apply`) |
 
 ## Tips
 
 - **Auto-detect project**: Run commands from a synced directory (contains `.olcli.json`) to skip the project argument
 - **Dry run**: Use `olcli push --dry-run` or `olcli sync --dry-run` to preview before applying
+- **Preview content**: `push --dry-run` lists files by modification time; `olcli diff` compares actual contents, so the two lists can differ
+- **CI gate**: `olcli diff --exit-code` exits 1 when anything differs and 2 when the run failed, so a pipeline can distinguish drift from breakage
 - **Force overwrite**: Use `olcli pull --force` to overwrite local changes
 - **Two-way deletes**: `olcli sync` propagates *local* deletions to the remote; use `--no-delete` to opt out per run
 - **Build artifacts**: `.aux`, `.bbl`, `.log`, `.synctex.gz` etc. are filtered by default. Add custom patterns to a `.olignore` file (gitignore-style)

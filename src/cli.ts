@@ -9,18 +9,38 @@
 import { Command } from 'commander';
 import chalk from 'chalk';
 import ora from 'ora';
-import { writeFileSync, readFileSync, existsSync, mkdirSync } from 'node:fs';
+import { writeFileSync, readFileSync, existsSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { join, dirname, basename } from 'node:path';
+import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { OverleafClient } from './client.js';
+import { resolveRemotePath, resolveWithin, normalizeRemotePath } from './paths.js';
+import { planProjectRenames } from './rename-plan.js';
+import { scanLocalFiles } from './scan.js';
 import {
-  loadIgnore,
-  shouldIgnore,
-  buildTexSiblingSet,
-  DEFAULT_IGNORE_PATTERNS,
-  type IgnoreContext,
-} from './ignore.js';
+  compareTrees,
+  DIFF_EXIT_FAILURE,
+  differencesExitCode,
+  filterRemoteTree,
+  renderFileDiff,
+  statusLetter,
+  type FileDiff,
+} from './diff.js';
+import {
+  DIFF_OUTPUT_DIR,
+  LatexdiffError,
+  RootDocumentError,
+  buildLatexdiffArgs,
+  diffOutputPath,
+  isTexPath,
+  latexdiffInstallHint,
+  materializeTree,
+  remoteScratchPath,
+  resolveRootDocument,
+  runLatexdiff,
+} from './latexdiff.js';
+import { loadIgnore } from './ignore.js';
 
 // Read version from package.json
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -31,7 +51,6 @@ import {
   setSessionCookie,
   getCookieJar,
   setCookieJar,
-  getLastProject,
   setLastProject,
   getConfigPath,
   saveOlAuth,
@@ -44,8 +63,11 @@ import {
   setTimeout,
   getPasswordCredentials,
   setPasswordCredentials,
+  clearOlAuth,
+  inspectStoredCredentials,
   type PasswordCredentials
 } from './config.js';
+import { promptHidden, PromptCancelled, NotATerminal } from './prompt.js';
 
 const program = new Command();
 
@@ -167,7 +189,7 @@ async function resolveProject(
     }
     
     // Otherwise, look up by name
-    let proj = await client.getProject(projectArg);
+    const proj = await client.getProject(projectArg);
     if (!proj) {
       throw new Error(`Project not found: ${projectArg}`);
     }
@@ -199,9 +221,18 @@ program
   .option('--agent-url <url>', 'Agent service URL (default: <base-url>/agent)')
   .option('--lb-srv-id <id>', 'Load balancer server ID (lb_srv_id cookie)')
   .option('--email <email>', 'Account email for password login')
-  .option('--password <password>', 'Account password for password login')
-  .option('--no-save-password', 'Do not persist email/password credentials')
+  .option('--password <password>', 'Account password (omit to be prompted; see warning below)')
+  .option('--save-password', 'Persist the password in the config file, in plaintext')
+  .option('--no-save-password', 'Do not persist the password (the default; kept for existing scripts)')
   .option('--save-local', 'Save to .olauth in current directory')
+  .addHelpText('after', `
+The password is not stored unless you ask for it with --save-password. A
+session cookie is stored either way, and that is what later commands use; the
+password only buys an automatic re-login once the cookie expires.
+
+Passing --password puts the password in your shell history. Omit it to be
+prompted instead, or set OVERLEAF_EMAIL and OVERLEAF_PASSWORD, which every
+command reads without needing 'auth' at all.`)
   .action(async (options) => {
     if (!options.cookie && !options.token && !options.email && !options.password) {
       const baseUrl = (program.opts().baseUrl as string | undefined) || getBaseUrl();
@@ -221,7 +252,8 @@ program
       console.log(chalk.cyan(`  olcli auth --cookie "your_session_cookie_value"`));
       console.log();
       console.log(chalk.bold('Method 3: Email/password (self-hosted without CAS)'));
-      console.log(chalk.cyan('  olcli auth --email "you@example.com" --password "your_password"'));
+      console.log(chalk.cyan('  olcli auth --email "you@example.com"'));
+      console.log(chalk.dim('  (prompts for the password, so it stays out of your shell history)'));
       console.log();
       console.log(chalk.dim('Or set OVERLEAF_SESSION environment variable'));
       return;
@@ -237,12 +269,42 @@ program
       process.exit(1);
     }
 
-    if (!options.cookie && !options.token && (!options.email || !options.password)) {
-      console.error(chalk.red('Both --email and --password are required for password login.'));
+    if (!options.cookie && !options.token && !options.email) {
+      console.error(chalk.red('--email is required for password login.'));
       process.exit(1);
     }
 
-    const spinner = ora('Authenticating...').start();
+    // Resolve the password before the spinner starts: a prompt and a spinner
+    // both own the terminal, and ora would redraw over the prompt line.
+    let password: string | undefined = options.password;
+    if (!options.cookie && !options.token) {
+      if (password) {
+        console.log(chalk.yellow('⚠ --password is now in your shell history.'));
+        console.log(chalk.dim('  Omit it to be prompted, or set OVERLEAF_EMAIL/OVERLEAF_PASSWORD.'));
+      } else {
+        try {
+          password = await promptHidden(`Password for ${options.email}: `);
+        } catch (error: any) {
+          if (error instanceof NotATerminal) {
+            console.error(chalk.red('No terminal available to prompt for a password.'));
+            console.error('Set OVERLEAF_EMAIL and OVERLEAF_PASSWORD instead — every command reads them,');
+            console.error("so a scripted run does not need 'olcli auth' at all.");
+            process.exit(1);
+          }
+          if (error instanceof PromptCancelled) {
+            console.error(chalk.red('Cancelled.'));
+            process.exit(1);
+          }
+          throw error;
+        }
+        if (!password) {
+          console.error(chalk.red('Password must not be empty.'));
+          process.exit(1);
+        }
+      }
+    }
+
+    const spinner = ora('Verifying session...').start();
     try {
       const baseUrl = (program.opts().baseUrl as string | undefined) || getBaseUrl();
       const cookieName = (program.opts().cookieName as string | undefined) || getSessionCookieName();
@@ -304,15 +366,30 @@ program
         }
       } else {
         spinner.text = 'Logging in with email/password...';
-        const client = await OverleafClient.fromPasswordLogin(options.email, options.password, baseUrl);
+        const client = await OverleafClient.fromPasswordLogin(options.email, password!, baseUrl);
         const projects = await client.listProjects();
         persistClientSession(client, cookieName);
         setBaseUrl(baseUrl);
-        if (options.savePassword !== false) {
-          setPasswordCredentials(options.email, options.password);
+
+        // Opt-in, not opt-out. The session cookie persisted just above is what
+        // later commands actually use; the password only buys an automatic
+        // re-login after that cookie expires, and it is stored in plaintext.
+        // A cookie is scoped to olcli and rotates; a password is reusable
+        // everywhere and cannot be revoked without changing it. See issue #50.
+        const savePassword = options.savePassword === true;
+        if (savePassword) {
+          setPasswordCredentials(options.email, password!);
         }
 
-        spinner.succeed(`Authenticated! Found ${projects.length} projects. Password login saved.`);
+        // The old message said "Password login saved." unconditionally - even
+        // under --no-save-password, which had just prevented exactly that.
+        spinner.succeed(`Authenticated! Found ${projects.length} projects.`);
+        if (savePassword) {
+          console.log(chalk.yellow('Password stored in plaintext in the config file.'));
+        } else {
+          console.log(chalk.dim('Session cookie stored. The password was not saved; re-run'));
+          console.log(chalk.dim('olcli auth when the session expires, or use --save-password.'));
+        }
       }
 
       console.log(chalk.dim(`Config saved to: ${getConfigPath()}`));
@@ -345,9 +422,41 @@ program
 program
   .command('logout')
   .description('Clear stored credentials')
+  .addHelpText('after', `
+Clears the global config and the .olauth file in the current directory, and
+reports each one separately. Environment variables cannot be cleared by a
+child process, so OVERLEAF_SESSION and OVERLEAF_EMAIL/OVERLEAF_PASSWORD are
+reported instead of silently ignored - both take precedence over anything on
+disk.`)
   .action(() => {
+    // Read before clearing: afterwards there is nothing left to report on.
+    const before = inspectStoredCredentials();
+
     clearConfig();
-    console.log(chalk.green('Credentials cleared'));
+    const removedOlAuth = clearOlAuth();
+
+    const cleared: string[] = [];
+    if (before.sessionCookie) cleared.push('session cookie (global config)');
+    if (before.password) cleared.push('saved password (global config)');
+    if (removedOlAuth) cleared.push(removedOlAuth);
+
+    if (cleared.length === 0) {
+      console.log('Nothing stored to clear.');
+    } else {
+      console.log(chalk.green('Cleared:'));
+      for (const item of cleared) console.log(`  ${item}`);
+    }
+
+    // The reason this command was wrong before: it announced success while a
+    // higher-precedence source kept the user authenticated. Anything olcli
+    // cannot clear has to be said out loud, or the message is a lie again.
+    if (before.envSession || before.envPassword) {
+      console.log();
+      console.log(chalk.yellow('Still authenticated in this shell:'));
+      if (before.envSession) console.log('  OVERLEAF_SESSION is set');
+      if (before.envPassword) console.log('  OVERLEAF_EMAIL and OVERLEAF_PASSWORD are set');
+      console.log(chalk.dim('  These outrank anything on disk. Unset them to finish logging out.'));
+    }
   });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -436,24 +545,6 @@ program
       process.exit(1);
     }
   });
-
-function printFolder(folder: any, indent: string): void {
-  // Print subfolders
-  for (const f of folder.folders || []) {
-    console.log(`${indent}📁 ${chalk.blue(f.name)}/`);
-    printFolder(f, indent + '  ');
-  }
-
-  // Print docs
-  for (const d of folder.docs || []) {
-    console.log(`${indent}📄 ${d.name}`);
-  }
-
-  // Print files
-  for (const f of folder.fileRefs || []) {
-    console.log(`${indent}📎 ${f.name}`);
-  }
-}
 
 const commentsCmd = program
   .command('comments')
@@ -724,6 +815,7 @@ program
   .command('pdf [project]')
   .description('Compile and download PDF')
   .option('-o, --output <path>', 'Output path (default: <project-name>.pdf)')
+  .option('-r, --resource <path>', 'Compile this .tex file as root document (e.g. paper.tex, folder/test.tex)')
   .option('--cookie <session>', 'Session cookie override')
   .action(async (project, options) => {
     const spinner = ora('Compiling project...').start();
@@ -732,7 +824,7 @@ program
       const proj = await resolveProject(client, project);
 
       spinner.text = 'Compiling...';
-      const pdf = await client.downloadPdf(proj.id);
+      const pdf = await client.downloadPdf(proj.id, undefined, options.resource);
       const outputPath = options.output || `${proj.name.replace(/[^a-zA-Z0-9-_]/g, '_')}.pdf`;
 
       writeFileSync(outputPath, pdf);
@@ -749,6 +841,7 @@ program
   .command('output [type]')
   .description('Download compile output files (bbl, log, aux, etc.)')
   .option('-o, --output <path>', 'Output path')
+  .option('-r, --resource <path>', 'Compile this .tex file as root document (e.g. paper.tex, folder/test.tex)')
   .option('--list', 'List available output files')
   .option('--project <name>', 'Project name or ID')
   .option('--cookie <session>', 'Session cookie override')
@@ -772,10 +865,10 @@ program
       }
 
       const proj = await resolveProject(client, projectArg);
-      const result = await client.compileWithOutputs(proj.id);
+      const result = await client.compileWithOutputs(proj.id, options.resource);
 
       if (result.status !== 'success') {
-        spinner.warn(`Compilation ${result.status}, but output files may still be available`);
+        spinner.warn(`Compilation ${result.status}, but output files may still be available${result.failureHint ?? ''}`);
       }
 
       if (options.list || !actualType) {
@@ -819,6 +912,7 @@ program
 program
   .command('upload <file> [project]')
   .description('Upload a file to a project')
+  .option('--to <path>', 'Destination path within the project (default: derived from <file>)')
   .option('--folder <id>', 'Target folder ID (default: root)')
   .option('--cookie <session>', 'Session cookie override')
   .action(async (file, project, options) => {
@@ -833,11 +927,11 @@ program
       }
 
       const content = readFileSync(file);
-      // Preserve the relative path (e.g. 'figures/fig01.png') so the file lands
-      // in the correct subfolder, not in project root. uploadFile() will
-      // lazy-resolve the folder tree when no folderId/tree is supplied.
-      // Normalize: strip leading './' and any leading slashes.
-      const fileName = file.replace(/^(\.\/)+/, '').replace(/^\/+/, '');
+      // Derive the remote path: an explicit --to wins, absolute paths collapse
+      // to their basename, relative paths keep their directory part so
+      // 'figures/fig01.png' still lands in the 'figures' folder. uploadFile()
+      // lazy-resolves the folder tree when no folderId/tree is supplied.
+      const fileName = resolveRemotePath(file, options.to);
 
       // Pass folder ID or null for root folder (client will compute it)
       const folderId = options.folder || null;
@@ -903,12 +997,192 @@ program
   });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// PROJECT COMMANDS (rename the project itself, not files inside it)
+// ─────────────────────────────────────────────────────────────────────────────
+
+const projectCmd = program
+  .command('project')
+  .description('Operate on projects themselves (create, rename, bulk rename)');
+
+projectCmd
+  .command('create <name>')
+  .description('Create a new project')
+  .option('-t, --template <type>', 'Project template: blank or example', 'blank')
+  .option('--json', 'Output as JSON')
+  .option('--cookie <session>', 'Session cookie override')
+  .action(async (name, options) => {
+    const template = options.template as string;
+    if (template !== 'blank' && template !== 'example') {
+      console.error(chalk.red(`Unsupported project template: ${template}`));
+      console.error('Supported templates: blank, example');
+      process.exit(1);
+    }
+
+    const spinner = ora('Creating project...').start();
+    try {
+      const client = await getClient(options.cookie);
+      const created = await client.createProject(name, { template });
+      setLastProject(created.id);
+
+      if (options.json) {
+        spinner.stop();
+        console.log(JSON.stringify(created, null, 2));
+        return;
+      }
+
+      spinner.succeed(`Created project: ${created.name}`);
+      console.log(`  ${chalk.cyan(created.id)}`);
+      console.log(`  ${chalk.cyan(created.url)}`);
+    } catch (error: any) {
+      spinner.fail(`Failed: ${error.message}`);
+      process.exit(1);
+    }
+  });
+
+projectCmd
+  .command('rename <newname> [project]')
+  .description('Rename a project')
+  .option('--dry-run', 'Show what would change without applying')
+  .option('--cookie <session>', 'Session cookie override')
+  .action(async (newname, project, options) => {
+    const spinner = ora('Renaming project...').start();
+    try {
+      const client = await getClient(options.cookie);
+      const proj = await resolveProject(client, project);
+
+      if (proj.name === newname) {
+        spinner.info(`Project is already named "${newname}"`);
+        return;
+      }
+
+      if (options.dryRun) {
+        spinner.stop();
+        console.log(chalk.bold('Would rename project:'));
+        console.log(`  ${chalk.cyan(proj.name)} \u2192 ${chalk.cyan(newname)}  ${chalk.dim(`(${proj.id})`)}`);
+        return;
+      }
+
+      await client.renameProject(proj.id, newname);
+      spinner.succeed(`Renamed project: ${proj.name} \u2192 ${newname}`);
+      setLastProject(proj.id);
+    } catch (error: any) {
+      spinner.fail(`Failed: ${error.message}`);
+      process.exit(1);
+    }
+  });
+
+projectCmd
+  .command('rename-bulk')
+  .description('Rename many projects at once by pattern (dry-run unless --apply)')
+  .option('--match <regex>', 'Only consider projects whose name matches this regex')
+  .option('--search <text>', 'Literal substring to replace in the name')
+  .option('--replace <text>', 'Replacement for --search or --match (supports $1, $2 backrefs)')
+  .option('--prefix <text>', 'Prepend this to the name')
+  .option('--suffix <text>', 'Append this to the name')
+  .option('--apply', 'Actually rename. Without this flag nothing is changed.')
+  .option('--max <n>', 'Refuse to apply if more than n projects would change', parseInt)
+  .option('--cookie <session>', 'Session cookie override')
+  .action(async (options) => {
+    // Inverted default on purpose: for a single project a dry-run flag is a
+    // convenience, but a bulk rename that fires on a typo is unrecoverable
+    // (Overleaf keeps no project-name history). So doing nothing is the
+    // default and --apply is the deliberate act.
+    const spinner = ora('Fetching projects...').start();
+    try {
+      const client = await getClient(options.cookie);
+      const projects = await client.listProjects();
+
+      let plan;
+      try {
+        plan = planProjectRenames(projects, {
+          match: options.match,
+          search: options.search,
+          replace: options.replace,
+          prefix: options.prefix,
+          suffix: options.suffix,
+        });
+      } catch (err: any) {
+        spinner.fail(err.message);
+        process.exit(1);
+      }
+
+      const { planned, skipped, collisions } = plan!;
+      spinner.stop();
+
+      if (planned.length === 0) {
+        console.log(chalk.yellow('No project names would change.'));
+        for (const s of skipped) {
+          console.log(chalk.dim(`  skipped ${s.name}: ${s.reason}`));
+        }
+        return;
+      }
+
+      console.log(chalk.bold(`${planned.length} project(s) would be renamed:`));
+      for (const p of planned) {
+        console.log(`  ${chalk.cyan(p.from)} ${chalk.dim('\u2192')} ${chalk.cyan(p.to)}  ${chalk.dim(`(${p.id})`)}`);
+      }
+      for (const s of skipped) {
+        console.log(chalk.dim(`  skipped ${s.name}: ${s.reason}`));
+      }
+
+      if (collisions.length > 0) {
+        console.log();
+        console.log(chalk.red(`Name collisions (${collisions.length}):`));
+        for (const c of collisions) console.log(chalk.red(`  ${c}`));
+        console.log(chalk.red('Refusing to apply. Overleaf allows duplicate names, so this would'));
+        console.log(chalk.red('succeed silently and leave projects you cannot tell apart.'));
+        process.exit(1);
+      }
+
+      if (options.max !== undefined && planned.length > options.max) {
+        console.log();
+        console.log(chalk.red(`Refusing to apply: ${planned.length} changes exceed --max ${options.max}.`));
+        process.exit(1);
+      }
+
+      if (!options.apply) {
+        console.log();
+        console.log(chalk.yellow('Dry run. Nothing was changed. Re-run with --apply to rename.'));
+        return;
+      }
+
+      const applySpinner = ora(`Renaming ${planned.length} project(s)...`).start();
+      let renamed = 0;
+      const failures: { from: string; reason: string }[] = [];
+      for (const p of planned) {
+        try {
+          await client.renameProject(p.id, p.to);
+          renamed++;
+          applySpinner.text = `Renaming... (${renamed}/${planned.length})`;
+        } catch (error: any) {
+          // Keep going: a partial rename is recoverable by re-running, while
+          // aborting midway leaves the same partial state plus no report.
+          failures.push({ from: p.from, reason: error.message || String(error) });
+        }
+      }
+
+      if (failures.length > 0) {
+        applySpinner.warn(`Renamed ${renamed} project(s), ${failures.length} failed`);
+        for (const f of failures) {
+          console.log(chalk.yellow(`  ${f.from}: ${f.reason}`));
+        }
+      } else {
+        applySpinner.succeed(`Renamed ${renamed} project(s)`);
+      }
+    } catch (error: any) {
+      spinner.fail(`Failed: ${error.message}`);
+      process.exit(1);
+    }
+  });
+
+// ─────────────────────────────────────────────────────────────────────────────
 // COMPILE COMMAND
 // ─────────────────────────────────────────────────────────────────────────────
 
 program
   .command('compile [project]')
   .description('Compile a project (trigger PDF generation)')
+  .option('-r, --resource <path>', 'Compile this .tex file as root document (e.g. paper.tex, folder/test.tex)')
   .option('--cookie <session>', 'Session cookie override')
   .action(async (project, options) => {
     const spinner = ora('Compiling...').start();
@@ -916,7 +1190,7 @@ program
       const client = await getClient(options.cookie);
       const proj = await resolveProject(client, project);
 
-      const result = await client.compileProject(proj.id);
+      const result = await client.compileProject(proj.id, options.resource);
       spinner.succeed(`Compiled "${proj.name}"`);
       console.log(chalk.dim(`PDF URL: ${result.pdfUrl}`));
 
@@ -1004,9 +1278,16 @@ program
       let skippedCount = 0;
       const skippedFiles: string[] = [];
 
+      const unsafeEntries: string[] = [];
+
       for (const entry of entries) {
         if (!entry.isDirectory) {
-          const filePath = join(targetDir, entry.entryName);
+          const filePath = resolveWithin(targetDir, entry.entryName);
+          if (!filePath) {
+            // Entry would escape the target directory (zip-slip) - never extract
+            unsafeEntries.push(entry.entryName);
+            continue;
+          }
           const fileDir = dirname(filePath);
 
           // Check if local file exists and is newer than last pull
@@ -1019,7 +1300,7 @@ program
                 skippedFiles.push(entry.entryName);
                 continue;
               }
-            } catch (e) {
+            } catch {
               // File doesn't exist or can't stat, proceed with download
             }
           }
@@ -1032,10 +1313,19 @@ program
         }
       }
 
+      if (unsafeEntries.length > 0) {
+        console.log(chalk.yellow(`  Skipped ${unsafeEntries.length} unsafe archive entr${unsafeEntries.length === 1 ? 'y' : 'ies'} (path escapes target directory):`));
+        for (const name of unsafeEntries.slice(0, 5)) {
+          console.log(chalk.dim(`    ${name}`));
+        }
+      }
+
       // Save project metadata (with manifest of remote files for sync deletion tracking)
       const remoteManifest: string[] = [];
       for (const e of entries) {
-        if (!e.isDirectory) remoteManifest.push(e.entryName);
+        if (!e.isDirectory && resolveWithin(targetDir, e.entryName)) {
+          remoteManifest.push(e.entryName);
+        }
       }
       writeFileSync(join(targetDir, '.olcli.json'), JSON.stringify({
         projectId,
@@ -1070,6 +1360,7 @@ program
   .description('Upload local changes to Overleaf project')
   .option('--project <name>', 'Project name or ID (overrides .olcli.json)')
   .option('--all', 'Upload all files (not just changed)')
+  .option('--delete', 'Propagate local deletions to the remote (opt-in; see docs)')
   .option('--dry-run', 'Show what would be uploaded without uploading')
   .option('--probe-folder', 'Probe for correct folder ID (use if uploads fail with folder_not_found)')
   .option('--no-default-ignore', 'Disable built-in LaTeX artifact ignore list (only .olignore applies)')
@@ -1086,12 +1377,21 @@ program
     let lastPull: Date | undefined;
     let rootFolderId: string | undefined;
 
+    let previousPushManifest: string[] = [];
+
     if (existsSync(metaPath)) {
       const meta = JSON.parse(readFileSync(metaPath, 'utf-8'));
       projectId = meta.projectId;
       projectName = meta.projectName;
       lastPull = meta.lastPull ? new Date(meta.lastPull) : undefined;
       rootFolderId = meta.rootFolderId;
+      // Written by a previous push (pushManifest) or pull (remoteManifest).
+      // Either is a valid baseline for "what did this directory last put there".
+      if (Array.isArray(meta.pushManifest)) {
+        previousPushManifest = meta.pushManifest as string[];
+      } else if (Array.isArray(meta.remoteManifest)) {
+        previousPushManifest = meta.remoteManifest as string[];
+      }
     }
 
     if (options.project) {
@@ -1133,50 +1433,21 @@ program
       });
 
       // Get list of files to upload
-      const { readdirSync, statSync } = await import('node:fs');
+      const { files: localFileList, ignored: filesIgnored } = scanLocalFiles(targetDir, ignoreCtx);
 
       const filesToUpload: { path: string; relativePath: string }[] = [];
-      const filesIgnored: string[] = [];
+      // Every local file that survives ignore filtering, regardless of mtime.
+      // filesToUpload is mtime-filtered and therefore useless as a deletion
+      // baseline: an unchanged file would look "absent" and get deleted.
+      const allLocalPaths = new Set<string>();
 
-      function scanDir(currentDir: string, relativeBase: string = '') {
-        const entries = readdirSync(currentDir, { withFileTypes: true });
-        // Pre-compute sibling .tex set for the PDF special rule.
-        const texSiblings = buildTexSiblingSet(
-          entries.filter((e) => !e.isDirectory()).map((e) => e.name),
-        );
-        for (const entry of entries) {
-          // Skip hidden files and .olcli.json (always — predates ignore subsystem)
-          if (entry.name.startsWith('.')) continue;
-
-          const fullPath = join(currentDir, entry.name);
-          const relativePath = relativeBase ? `${relativeBase}/${entry.name}` : entry.name;
-
-          if (entry.isDirectory()) {
-            // Test directory ignore (gitignore semantics: trailing slash matches dir)
-            if (shouldIgnore(`${relativePath}/`, ignoreCtx)) {
-              filesIgnored.push(`${relativePath}/`);
-              continue;
-            }
-            scanDir(fullPath, relativePath);
-          } else {
-            if (shouldIgnore(relativePath, ignoreCtx, texSiblings)) {
-              filesIgnored.push(relativePath);
-              continue;
-            }
-            // Check if file is newer than last pull (unless --all)
-            if (options.all || !lastPull) {
-              filesToUpload.push({ path: fullPath, relativePath });
-            } else {
-              const stats = statSync(fullPath);
-              if (stats.mtime > lastPull) {
-                filesToUpload.push({ path: fullPath, relativePath });
-              }
-            }
-          }
+      for (const file of localFileList) {
+        allLocalPaths.add(file.relativePath);
+        // Check if file is newer than last pull (unless --all)
+        if (options.all || !lastPull || file.mtime > lastPull) {
+          filesToUpload.push({ path: file.path, relativePath: file.relativePath });
         }
       }
-
-      scanDir(targetDir);
 
       if (options.showIgnored && filesIgnored.length > 0) {
         spinner.stop();
@@ -1187,16 +1458,52 @@ program
         spinner.start('Scanning files...');
       }
 
-      if (filesToUpload.length === 0) {
+      // Deletion candidates: tracked by a previous push/pull from THIS directory,
+      // gone locally now. Never derived from the remote listing - that would also
+      // sweep away files someone else uploaded through the Overleaf editor.
+      //
+      // Skipped entirely without a baseline manifest: on a first push we cannot
+      // tell "deleted locally" from "never existed here", and guessing wrong
+      // destroys remote work.
+      const filesToDelete: string[] = [];
+      if (options.delete && previousPushManifest.length > 0) {
+        for (const path of previousPushManifest) {
+          if (path === 'output.pdf' || path.endsWith('/output.pdf')) continue;
+          if (!allLocalPaths.has(path)) filesToDelete.push(path);
+        }
+      }
+      const noBaseline = options.delete === true && previousPushManifest.length === 0;
+
+      if (filesToUpload.length === 0 && filesToDelete.length === 0) {
         spinner.info('No files to upload');
+        if (noBaseline) {
+          console.log(chalk.dim('  --delete skipped: no manifest yet (first push from this directory)'));
+        }
         return;
       }
 
       if (options.dryRun) {
         spinner.stop();
-        console.log(chalk.bold(`Would upload ${filesToUpload.length} file(s) to "${projectName}":`));
-        for (const f of filesToUpload) {
-          console.log(`  ${chalk.cyan(f.relativePath)}`);
+        if (filesToUpload.length > 0) {
+          console.log(chalk.bold(`Would upload ${filesToUpload.length} file(s) to "${projectName}":`));
+          for (const f of filesToUpload) {
+            console.log(`  ${chalk.cyan(f.relativePath)}`);
+          }
+        }
+        if (filesToDelete.length > 0) {
+          console.log(chalk.bold(`Would delete ${filesToDelete.length} file(s) on "${projectName}":`));
+          for (const p of filesToDelete) {
+            console.log(`  ${chalk.red(p)}`);
+          }
+        }
+        if (noBaseline) {
+          console.log(chalk.dim('  --delete skipped: no manifest yet (first push from this directory)'));
+        }
+        // This list is mtime-based: a file touched but not edited is in it, and
+        // a file whose bytes already match the remote is too. `olcli diff`
+        // compares content instead.
+        if (filesToUpload.length > 0) {
+          console.log(chalk.dim('  selected by modification time — run `olcli diff` to see content changes'));
         }
         return;
       }
@@ -1251,10 +1558,29 @@ program
         }
       }
 
-      // Update last push time
+      // Deletions run after uploads: a rename arrives as add+remove, and doing
+      // it in this order never leaves the remote without the file.
+      let deleted = 0;
+      const deleteSkipped: { path: string; reason: string }[] = [];
+      if (filesToDelete.length > 0) {
+        spinner.text = `Deleting ${filesToDelete.length} remote file(s)...`;
+        for (const path of filesToDelete) {
+          try {
+            await client.deleteByPath(projectId!, path);
+            deleted++;
+          } catch (error: any) {
+            // Already gone remotely is the common case and not an error worth
+            // failing the push over.
+            deleteSkipped.push({ path, reason: error.message || String(error) });
+          }
+        }
+      }
+
+      // Update last push time and the manifest that the next --delete reads.
       if (existsSync(metaPath)) {
         const meta = JSON.parse(readFileSync(metaPath, 'utf-8'));
         meta.lastPush = new Date().toISOString();
+        meta.pushManifest = Array.from(allLocalPaths).sort();
         writeFileSync(metaPath, JSON.stringify(meta, null, 2));
       }
 
@@ -1265,6 +1591,19 @@ program
         }
       } else {
         spinner.succeed(`Uploaded ${uploaded} file(s) to "${projectName}"`);
+      }
+
+      if (deleted > 0) {
+        console.log(chalk.dim(`  ✖ ${deleted} deleted on remote`));
+      }
+      if (deleteSkipped.length > 0) {
+        console.log(chalk.yellow(`  ${deleteSkipped.length} deletion(s) skipped:`));
+        for (const s of deleteSkipped) {
+          console.log(chalk.dim(`    ${s.path}: ${s.reason}`));
+        }
+      }
+      if (noBaseline) {
+        console.log(chalk.dim('  --delete skipped: no manifest yet; next push has a baseline'));
       }
 
       setLastProject(projectId!);
@@ -1348,42 +1687,18 @@ program
 
       // Track local modifications
       const localFiles = new Map<string, { mtime: Date; content: Buffer }>();
-      const filesIgnored: string[] = [];
-      const { readdirSync, statSync } = await import('node:fs');
-
-      function scanLocalFiles(currentDir: string, relativeBase: string = '') {
-        if (!existsSync(currentDir)) return;
-        const entries = readdirSync(currentDir, { withFileTypes: true });
-        const texSiblings = buildTexSiblingSet(
-          entries.filter((e) => !e.isDirectory()).map((e) => e.name),
-        );
-        for (const entry of entries) {
-          if (entry.name.startsWith('.')) continue;
-          const fullPath = join(currentDir, entry.name);
-          const relativePath = relativeBase ? `${relativeBase}/${entry.name}` : entry.name;
-          if (entry.isDirectory()) {
-            if (shouldIgnore(`${relativePath}/`, ignoreCtx)) {
-              filesIgnored.push(`${relativePath}/`);
-              continue;
-            }
-            scanLocalFiles(fullPath, relativePath);
-          } else {
-            if (shouldIgnore(relativePath, ignoreCtx, texSiblings)) {
-              filesIgnored.push(relativePath);
-              continue;
-            }
-            const stats = statSync(fullPath);
-            localFiles.set(relativePath, {
-              mtime: stats.mtime,
-              content: readFileSync(fullPath)
-            });
-          }
-        }
-      }
+      let filesIgnored: string[] = [];
 
       // Read local files before overwriting
-      if (existsSync(metaPath)) {
-        scanLocalFiles(targetDir);
+      if (existsSync(targetDir) && existsSync(metaPath)) {
+        const scan = scanLocalFiles(targetDir, ignoreCtx);
+        filesIgnored = scan.ignored;
+        for (const file of scan.files) {
+          localFiles.set(file.relativePath, {
+            mtime: file.mtime,
+            content: readFileSync(file.path)
+          });
+        }
       }
 
       if (options.showIgnored && filesIgnored.length > 0) {
@@ -1395,12 +1710,22 @@ program
         spinner.start();
       }
 
-      // Extract remote files
+      // Extract remote files (skipping entries that would escape the target
+      // directory - zip-slip protection)
       const remoteFiles = new Map<string, Buffer>();
+      const unsafeRemoteEntries: string[] = [];
       for (const entry of zip.getEntries()) {
         if (!entry.isDirectory) {
+          if (!resolveWithin(targetDir, entry.entryName)) {
+            unsafeRemoteEntries.push(entry.entryName);
+            continue;
+          }
           remoteFiles.set(entry.entryName, entry.getData());
         }
+      }
+      if (unsafeRemoteEntries.length > 0) {
+        spinner.warn(`Skipped ${unsafeRemoteEntries.length} unsafe archive entr${unsafeRemoteEntries.length === 1 ? 'y' : 'ies'} (path escapes target directory)`);
+        spinner.start();
       }
 
       // Merge: local changes take precedence for files modified after last pull
@@ -1461,7 +1786,8 @@ program
 
       // Write remote files, but preserve local modifications
       for (const [path, remoteContent] of remoteFiles) {
-        const filePath = join(targetDir, path);
+        const filePath = resolveWithin(targetDir, path);
+        if (!filePath) continue; // already filtered above; defense in depth
         const fileDir = dirname(filePath);
         if (!existsSync(fileDir)) {
           mkdirSync(fileDir, { recursive: true });
@@ -1566,6 +1892,488 @@ program
       process.exit(1);
     }
   });
+
+program
+  .command('diff [project] [dir]')
+  .description('Show content-level differences between local files and the remote project')
+  .option('--name-only', 'List changed paths instead of printing patches')
+  .option('--file <path>', 'Diff a single file')
+  .option('-U, --unified <n>', 'Lines of context around each hunk (default: 3)', parseInt)
+  .option('--exit-code', 'Exit 1 if anything differs, 0 if nothing does, 2 on failure (for CI)')
+  .option('--latexdiff', 'Mark the revision up inside the document with latexdiff (requires latexdiff on PATH)')
+  .option('--pdf', 'Compile the marked-up document on Overleaf and download the PDF (implies --latexdiff)')
+  .option('--main <path>', 'Root .tex document to mark up (default: the only file declaring \\documentclass)')
+  .option('-o, --output <path>', `Where to write the marked-up .tex (default: ${DIFF_OUTPUT_DIR}/<root>-diff.tex)`)
+  .option('--no-flatten', 'Leave \\input/\\include in place instead of inlining them')
+  .option('--latexdiff-opt <opt>', 'Pass an option straight through to latexdiff (repeatable)',
+    (value: string, previous: string[] = []) => [...previous, value])
+  .option('--no-default-ignore', 'Disable built-in LaTeX artifact ignore list (only .olignore applies)')
+  .option('--no-ignore', 'Disable all ignore filtering')
+  .option('--cookie <session>', 'Session cookie override')
+  .addHelpText('after', `
+The remote side is fetched fresh on every run, so the diff describes the
+project as it is right now - which is what a subsequent push would overwrite.
+It is not a comparison against the last pull. A collaborator editing between
+diff and push can still change the outcome; the fetch time is printed for that
+reason.
+
+--latexdiff hands those same two sides to latexdiff and marks the revision up
+inside the document instead: struck through is what a push would overwrite,
+underlined is what it would upload. --pdf additionally uploads the marked-up
+document to the project for one compile, downloads the PDF, and removes it
+again - so a reviewable PDF needs no local TeX installation.
+
+--exit-code makes the command a CI gate, with diff(1)'s statuses: 0 when
+nothing differs, 1 when something does, and 2 when the run itself failed. The
+last one matters - without it a pipeline cannot tell a changed file from an
+expired session cookie. It applies to whatever was compared, so --file narrows
+the gate to one file, and it reports on the project even under --latexdiff,
+where the markup only covers the root document.`)
+  .action(async (project, dir, options) => {
+    const targetDir = dir || '.';
+
+    // Every way this command can fail, as opposed to finding differences.
+    // Under --exit-code that has to be distinguishable from status 1, or a
+    // pipeline reads "could not reach Overleaf" as "the paper changed"; with
+    // the flag absent it stays 1, which is what every other command exits.
+    const failureCode = options.exitCode ? DIFF_EXIT_FAILURE : 1;
+
+    if (!existsSync(targetDir)) {
+      console.error(chalk.red(`Directory not found: ${targetDir}`));
+      process.exit(failureCode);
+    }
+
+    // Checked before connecting: an unusable combination of flags should not
+    // cost a login and a full project download first.
+    const latexdiffMode = Boolean(options.latexdiff || options.pdf);
+    const conflicting = [
+      options.nameOnly ? '--name-only' : null,
+      options.file ? '--file' : null,
+      options.unified !== undefined ? '-U/--unified' : null,
+    ].filter(Boolean);
+
+    if (latexdiffMode && conflicting.length > 0) {
+      console.error(chalk.red(`--latexdiff cannot be combined with ${conflicting.join(', ')}`));
+      console.error('It marks up one root document; those options select and shape unified patch output.');
+      process.exit(failureCode);
+    }
+
+    if (!latexdiffMode) {
+      // Accepting these silently would produce a normal patch and no markup,
+      // with nothing in the output saying the flag was dropped.
+      const latexdiffOnly = [
+        options.main ? '--main' : null,
+        options.output ? '--output' : null,
+        options.latexdiffOpt?.length ? '--latexdiff-opt' : null,
+      ].filter(Boolean);
+      if (latexdiffOnly.length > 0) {
+        console.error(chalk.red(`${latexdiffOnly.join(', ')} only applies with --latexdiff`));
+        process.exit(failureCode);
+      }
+    }
+
+    const spinner = ora('Connecting...').start();
+    try {
+      const client = await getClient(options.cookie);
+
+      let resolved;
+      try {
+        resolved = await resolveProject(client, project, targetDir);
+      } catch (error: any) {
+        spinner.fail(error.message);
+        console.error('Either run from a directory with .olcli.json or pass a project name/ID');
+        process.exit(failureCode);
+      }
+      const { id: projectId, name: projectName } = resolved;
+
+      // The whole project arrives as one zip in a single request - the same
+      // call pull and sync already make. Fetching per-file would mean one
+      // request per file and could not tell us which files differ without
+      // downloading them anyway.
+      spinner.text = 'Fetching remote project...';
+      const zipBuffer = await client.downloadProject(projectId);
+      const fetchedAt = new Date();
+
+      const AdmZip = (await import('adm-zip')).default;
+      const zip = new AdmZip(zipBuffer);
+
+      const ignoreCtx = loadIgnore(targetDir, {
+        noDefaults: options.defaultIgnore === false,
+        disableAll: options.ignore === false,
+      });
+
+      // Both sides go through the same filters; see filterRemoteTree.
+      const remoteFiles = filterRemoteTree(
+        zip.getEntries()
+          .filter((e) => !e.isDirectory)
+          .map((e) => ({ path: e.entryName, data: e.getData() })),
+        ignoreCtx,
+        (path) => resolveWithin(targetDir, path) !== null,
+      );
+
+      const scan = scanLocalFiles(targetDir, ignoreCtx);
+      const localFiles = new Map<string, Buffer>();
+      for (const file of scan.files) {
+        localFiles.set(file.relativePath, readFileSync(file.path));
+      }
+
+      let entries = compareTrees(localFiles, remoteFiles).filter((e) => e.status !== 'unchanged');
+
+      if (latexdiffMode) {
+        await runLatexdiffMode({
+          client,
+          projectId,
+          projectName,
+          targetDir,
+          localFiles,
+          remoteFiles,
+          entries,
+          fetchedAt,
+          failureCode,
+          options,
+          spinner,
+        });
+        setLastProject(projectId);
+        // Reports on the comparison, not on the markup: a changed figure is a
+        // difference in the project even though a marked-up root document
+        // cannot show it. The `No .tex file differs` line above says as much.
+        if (options.exitCode) process.exitCode = differencesExitCode(entries);
+        return;
+      }
+
+      if (options.file) {
+        const wanted = normalizeRemotePath(options.file);
+        entries = entries.filter((e) => e.path === wanted);
+        if (entries.length === 0) {
+          spinner.info(`No differences in ${wanted}`);
+          if (!localFiles.has(wanted) && !remoteFiles.has(wanted)) {
+            console.log(chalk.dim('  (file is on neither side, or is filtered by an ignore rule)'));
+          }
+          return;
+        }
+      }
+
+      spinner.stop();
+
+      if (entries.length === 0) {
+        console.log(chalk.green(`No differences — local files match "${projectName}"`));
+        console.log(chalk.dim(`  remote fetched ${fetchedAt.toISOString()}`));
+        return;
+      }
+
+      if (options.nameOnly) {
+        for (const e of entries) {
+          const colour = e.status === 'added' ? chalk.green
+            : e.status === 'deleted' ? chalk.red
+            : chalk.yellow;
+          console.log(`${colour(statusLetter(e.status))}  ${e.path}`);
+        }
+      } else {
+        for (const e of entries) {
+          const patch = renderFileDiff(
+            e,
+            localFiles.get(e.path),
+            remoteFiles.get(e.path),
+            { context: options.unified },
+          );
+          patch.replace(/\n$/, '').split('\n').forEach((line, index) => {
+            console.log(colourizeDiffLine(line, index, e.binary));
+          });
+        }
+      }
+
+      console.log();
+      // With --file the summary would count only the one file asked for, which
+      // reads as "this is all that differs". Report totals only for a full run.
+      if (!options.file) {
+        const counts = {
+          added: entries.filter((e) => e.status === 'added').length,
+          modified: entries.filter((e) => e.status === 'modified').length,
+          deleted: entries.filter((e) => e.status === 'deleted').length,
+        };
+        console.log(chalk.bold(
+          `${entries.length} file(s) differ from "${projectName}": ` +
+          `${counts.added} added, ${counts.modified} modified, ${counts.deleted} remote-only`
+        ));
+        if (counts.deleted > 0) {
+          console.log(chalk.dim('  remote-only files are left alone by push; use push --delete to remove them'));
+        }
+      }
+      console.log(chalk.dim(`  a/ = remote as of ${fetchedAt.toISOString()}, b/ = local`));
+
+      setLastProject(projectId);
+      // Set rather than exited: `process.exit` drops whatever is still
+      // buffered on a non-TTY stdout, and `olcli diff --exit-code > patch.txt`
+      // is precisely a large patch going into a pipe. Returning lets node
+      // flush and then exit with this status on its own.
+      if (options.exitCode) process.exitCode = differencesExitCode(entries);
+    } catch (error: any) {
+      spinner.fail(`Failed: ${error.message}`);
+      process.exit(failureCode);
+    }
+  });
+
+/**
+ * `--latexdiff` / `--pdf`: mark the revision up inside the document.
+ *
+ * Runs on the two sides `diff` has already fetched, so the semantics are the
+ * ones documented for the command - old is the remote as of this run, new is
+ * the working directory - and no extra request is made to produce the markup.
+ *
+ * The remote side has to reach the filesystem before `latexdiff` can read it,
+ * and the whole tree is written rather than the root document alone, because
+ * `--flatten` resolves each `\input` relative to its own side.
+ */
+async function runLatexdiffMode(params: {
+  client: OverleafClient;
+  projectId: string;
+  projectName: string;
+  targetDir: string;
+  localFiles: Map<string, Buffer>;
+  remoteFiles: Map<string, Buffer>;
+  entries: FileDiff[];
+  fetchedAt: Date;
+  /** What to exit with when this mode fails; 2 under --exit-code, else 1. */
+  failureCode: number;
+  /** Only the flags this mode reads; the rest of `diff`'s options are rejected. */
+  options: {
+    main?: string;
+    output?: string;
+    pdf?: boolean;
+    flatten?: boolean;
+    latexdiffOpt?: string[];
+  };
+  spinner: ReturnType<typeof ora>;
+}): Promise<void> {
+  const {
+    client, projectId, projectName, targetDir,
+    localFiles, remoteFiles, entries, fetchedAt, failureCode, options, spinner,
+  } = params;
+
+  let root = '';
+  try {
+    root = resolveRootDocument(localFiles, options.main ? normalizeRemotePath(options.main) : undefined);
+  } catch (error) {
+    if (!(error instanceof RootDocumentError)) throw error;
+    spinner.stop();
+    console.error(chalk.red(error.message));
+    for (const candidate of error.candidates) {
+      console.error(chalk.dim(`    ${candidate}`));
+    }
+    process.exit(failureCode);
+  }
+
+  // latexdiff needs two versions of the same document. A root document that
+  // only exists locally has one, and diffing it against an empty file would
+  // mark up the entire paper as an addition.
+  if (!remoteFiles.has(root)) {
+    spinner.stop();
+    console.error(chalk.red(`${root} is not in "${projectName}" yet, so there is no earlier version to mark up.`));
+    console.error(chalk.dim('  Push it first, or use --main to name a document that exists on both sides.'));
+    process.exit(failureCode);
+  }
+
+  if (!entries.some((e) => isTexPath(e.path))) {
+    spinner.info(`No .tex file differs from "${projectName}" - the markup will show no changes`);
+  }
+
+  const tmpRoot = mkdtempSync(join(tmpdir(), 'olcli-latexdiff-'));
+  const cleanupTmp = () => rmSync(tmpRoot, { recursive: true, force: true });
+
+  try {
+    spinner.start('Writing the remote side to a temporary directory...');
+    materializeTree(tmpRoot, remoteFiles);
+
+    spinner.text = `Running latexdiff on ${root}...`;
+    let markup = '';
+    let warnings = '';
+    try {
+      const result = await runLatexdiff(buildLatexdiffArgs(
+        join(tmpRoot, root),
+        join(targetDir, root),
+        { flatten: options.flatten !== false, extra: options.latexdiffOpt },
+      ));
+      markup = result.markup;
+      warnings = result.stderr.trim();
+    } catch (error) {
+      if (!(error instanceof LatexdiffError)) throw error;
+      spinner.fail(error.message);
+      if (error.missing) {
+        console.error(chalk.dim(`  ${latexdiffInstallHint()}`));
+        console.error(chalk.dim('  Everything else in olcli diff needs no external tools.'));
+      } else if (error.stderr) {
+        console.error(error.stderr);
+      }
+      cleanupTmp();
+      process.exit(failureCode);
+    }
+
+    // An explicit --output is a path the user chose, so it is taken relative to
+    // the current directory; the default belongs to the project directory being
+    // diffed. Either way the PDF sits next to the source it was built from.
+    const texPath = options.output || join(targetDir, diffOutputPath(root, 'tex'));
+    const pdfPath = texPath.replace(/\.(tex|ltx)$/i, '') + '.pdf';
+
+    mkdirSync(dirname(texPath), { recursive: true });
+    writeFileSync(texPath, markup, 'utf-8');
+    spinner.succeed(`Marked up ${root} (${(Buffer.byteLength(markup) / 1024).toFixed(1)} KB)`);
+
+    if (warnings) {
+      for (const line of warnings.split('\n')) {
+        console.log(chalk.yellow(`  latexdiff: ${line}`));
+      }
+    }
+
+    if (options.pdf) {
+      await compileMarkupOnOverleaf({ client, projectId, projectName, root, markup, texPath, pdfPath, failureCode, spinner });
+    }
+
+    console.log();
+    console.log(chalk.bold(`Revision of ${root} against "${projectName}"`));
+    console.log(`  ${texPath}`);
+    if (options.pdf) console.log(`  ${pdfPath}`);
+    console.log(chalk.dim(
+      `  struck through = remote as of ${fetchedAt.toISOString()}, underlined = local`,
+    ));
+    if (options.flatten !== false) {
+      console.log(chalk.dim('  \\input/\\include were inlined; pass --no-flatten to keep them'));
+    }
+  } finally {
+    cleanupTmp();
+  }
+}
+
+/**
+ * Compile a marked-up document with Overleaf's compiler and download the PDF.
+ *
+ * The compile endpoint takes a `rootResourcePath` that has to already exist in
+ * the project - there is no way to compile a document that is not in it. So
+ * the markup is uploaded, compiled, and removed again, which is a real
+ * mutation of someone's project for the duration of one compile and is
+ * announced before it happens.
+ *
+ * Three things follow from that and are not incidental:
+ *
+ * - The upload refuses to overwrite. If the scratch path is taken, that file
+ *   belongs to the user, and clobbering it to produce a diff would be a worse
+ *   outcome than not producing one.
+ * - The delete runs from a `finally`, and nothing between the upload and it
+ *   calls `process.exit` - that would terminate before the cleanup and leave
+ *   the file on the project. Failures are collected and reported afterwards.
+ * - An interrupt cannot be cleaned up after reliably, so it prints the exact
+ *   command that removes the file rather than leaving it to be discovered.
+ */
+async function compileMarkupOnOverleaf(params: {
+  client: OverleafClient;
+  projectId: string;
+  projectName: string;
+  root: string;
+  markup: string;
+  texPath: string;
+  pdfPath: string;
+  /** What to exit with when the compile fails; 2 under --exit-code, else 1. */
+  failureCode: number;
+  spinner: ReturnType<typeof ora>;
+}): Promise<void> {
+  const { client, projectId, projectName, root, markup, texPath, pdfPath, failureCode, spinner } = params;
+  const scratch = remoteScratchPath(root);
+
+  spinner.start(`Checking ${scratch} is free...`);
+  if (await client.findEntityByPath(projectId, scratch)) {
+    spinner.fail(`"${projectName}" already has a file named ${scratch}`);
+    console.error(chalk.dim('  --pdf uploads the marked-up document under that name for one compile and'));
+    console.error(chalk.dim('  removes it again; it will not overwrite a file that is already there.'));
+    console.error(chalk.dim(`  The marked-up source was still written: ${texPath}`));
+    process.exit(failureCode);
+  }
+
+  spinner.stop();
+  console.log(chalk.dim(`  uploading ${scratch} to "${projectName}" for one compile, then removing it`));
+
+  const onInterrupt = () => {
+    console.error(chalk.yellow(`\nInterrupted with ${scratch} still in "${projectName}".`));
+    console.error(chalk.yellow(`Remove it with: olcli rm ${scratch}`));
+    process.exit(130);
+  };
+
+  spinner.start('Uploading the marked-up document...');
+  await client.uploadFile(projectId, null, scratch, Buffer.from(markup, 'utf-8'));
+  process.once('SIGINT', onInterrupt);
+
+  let failure: string[] | null = null;
+
+  try {
+    spinner.text = 'Compiling on Overleaf...';
+    const compile = await client.compileWithOutputs(projectId, scratch);
+
+    if (compile.status !== 'success' || !compile.pdfUrl) {
+      failure = [`Overleaf reported "${compile.status}" compiling ${scratch}`];
+
+      // The log is the only thing that explains a LaTeX failure, and it stops
+      // being reachable as soon as the scratch file is removed below.
+      const logFile = compile.outputFiles.find((f) => f.path === 'output.log');
+      if (logFile) {
+        const logPath = pdfPath.replace(/\.pdf$/, '.log');
+        writeFileSync(logPath, await client.downloadOutputFile(logFile.url));
+        failure.push(`  compiler log: ${logPath}`);
+      }
+      failure.push(`  marked-up source: ${texPath}`);
+      // A .sty or .cls that only exists locally is the common one: Overleaf
+      // compiles against the project, so anything the markup needs has to be
+      // in the project. A missing *figure* does not fail - Overleaf draws a
+      // placeholder box naming the file and reports success.
+      failure.push('  A class, style or input file that exists only locally is the usual cause;');
+      failure.push('  Overleaf compiles against the project, not against your working directory.');
+
+      // A PDF from an earlier run would otherwise sit next to the log, dated
+      // now by the directory listing and describing a different revision.
+      rmSync(pdfPath, { force: true });
+    } else {
+      spinner.text = 'Downloading the PDF...';
+      const pdf = await client.downloadOutputFile(compile.pdfUrl);
+      writeFileSync(pdfPath, pdf);
+      spinner.succeed(`Compiled ${basename(pdfPath)} (${(pdf.length / 1024).toFixed(1)} KB)`);
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    failure = [`Compiling ${scratch} failed: ${message}`, `  marked-up source: ${texPath}`];
+  } finally {
+    process.off('SIGINT', onInterrupt);
+    spinner.start(`Removing ${scratch} from "${projectName}"...`);
+    try {
+      await client.deleteByPath(projectId, scratch);
+      spinner.stop();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      spinner.warn(`${scratch} is still in "${projectName}": ${message}`);
+      console.error(chalk.yellow(`  remove it with: olcli rm ${scratch}`));
+    }
+  }
+
+  if (failure) {
+    spinner.fail(failure[0]);
+    for (const line of failure.slice(1)) console.error(chalk.dim(line));
+    process.exit(failureCode);
+  }
+}
+
+/**
+ * Colourize one line of a rendered patch. chalk already no-ops when stdout is
+ * not a TTY, so this needs no flag of its own.
+ *
+ * The file headers are identified by position, not by prefix: a removed line
+ * whose own content starts with `--` renders as `--- something` and would
+ * otherwise be mistaken for the `---` header and shown as unchanged.
+ */
+function colourizeDiffLine(line: string, index: number, binary: boolean): string {
+  if (index === 0) return chalk.bold(line);          // our `diff --olcli` header
+  if (binary) return chalk.magenta(line);            // the single summary line
+  if (index <= 2) return chalk.bold(line);           // `---` / `+++`
+  if (line.startsWith('@@')) return chalk.cyan(line);
+  if (line.startsWith('+')) return chalk.green(line);
+  if (line.startsWith('-')) return chalk.red(line);
+  return line;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // HELP
@@ -1682,6 +2490,22 @@ program
       console.log(chalk.dim(`  Value: ${cookie.substring(0, 20)}...`));
     } else {
       console.log(chalk.yellow('✗ No session cookie found'));
+    }
+
+    // A stored password is a credential source this command used to omit,
+    // which made it impossible to answer "is my password on disk?" without
+    // opening the config file. Never print the value - only whether it exists
+    // and which source it came from.
+    const stored = inspectStoredCredentials();
+    if (stored.envPassword) {
+      console.log(chalk.yellow('⚠ Password set via OVERLEAF_EMAIL/OVERLEAF_PASSWORD'));
+    } else if (stored.password) {
+      console.log(chalk.yellow('⚠ Password stored in plaintext in the config file'));
+      console.log(chalk.dim("  Remove it with 'olcli logout', then re-auth without --save-password."));
+    }
+
+    if (stored.olAuthPath) {
+      console.log(chalk.dim(`  .olauth present: ${stored.olAuthPath}`));
     }
   });
 

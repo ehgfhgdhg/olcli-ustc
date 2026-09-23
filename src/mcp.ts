@@ -24,6 +24,11 @@ import { join, resolve } from 'node:path';
 import AdmZip from 'adm-zip';
 
 import { OverleafClient } from './client.js';
+import { resolveRemotePath, resolveWithin, normalizeRemotePath } from './paths.js';
+import { planProjectRenames } from './rename-plan.js';
+import { scanLocalFiles } from './scan.js';
+import { compareTrees, filterRemoteTree, renderFileDiff } from './diff.js';
+import { loadIgnore } from './ignore.js';
 import {
   getSessionCookie,
   getBaseUrl,
@@ -103,7 +108,7 @@ async function getClient(): Promise<OverleafClient> {
 const server = new McpServer(
   {
     name: 'olcli',
-    version: '0.7.0',
+    version: '0.8.0',
   },
   {
     capabilities: { tools: {} },
@@ -221,14 +226,16 @@ server.tool(
     remote_path: z
       .string()
       .optional()
-      .describe('Target path within the project (default: basename of local_path)'),
+      .describe(
+        'Target path within the project. Defaults to the basename for absolute local paths, or the relative path as given (e.g. "figures/diagram.png")'
+      ),
   },
   async ({ project_id, local_path, remote_path }) =>
     wrapTool(async () => {
       const client = await getClient();
       const absPath = resolve(local_path);
       const content = await readFile(absPath);
-      const remoteName = remote_path ?? local_path.split('/').pop() ?? local_path;
+      const remoteName = resolveRemotePath(local_path, remote_path);
       return client.uploadFile(project_id, null, remoteName, content);
     })
 );
@@ -242,11 +249,15 @@ server.tool(
   'Compile an Overleaf project using the remote LaTeX compiler. Returns the PDF URL and any log messages.',
   {
     project_id: z.string().describe('The Overleaf project ID'),
+    resource_path: z
+      .string()
+      .optional()
+      .describe('Path of a .tex file in the project to compile as the root document. E.g. "paper.tex", "folder/test.tex"'),
   },
-  async ({ project_id }) =>
+  async ({ project_id, resource_path }) =>
     wrapTool(async () => {
       const client = await getClient();
-      return client.compileProject(project_id);
+      return client.compileProject(project_id, resource_path);
     })
 );
 
@@ -260,11 +271,15 @@ server.tool(
   {
     project_id: z.string().describe('The Overleaf project ID'),
     output_path: z.string().describe('Local file path where the PDF should be saved (e.g. output.pdf)'),
+    resource_path: z
+      .string()
+      .optional()
+      .describe('Path of a .tex file in the project to compile as the root document. E.g. "paper.tex", "folder/test.tex"'),
   },
-  async ({ project_id, output_path }) =>
+  async ({ project_id, output_path, resource_path }) =>
     wrapTool(async () => {
       const client = await getClient();
-      const pdfBuf = await client.downloadPdf(project_id);
+      const pdfBuf = await client.downloadPdf(project_id, undefined, resource_path);
       const absPath = resolve(output_path);
       writeFileSync(absPath, pdfBuf);
       return {
@@ -468,11 +483,225 @@ server.tool(
   'Compile an Overleaf project and return all output file metadata (PDF, BBL, logs, etc.). Useful for arXiv submission workflows.',
   {
     project_id: z.string().describe('The Overleaf project ID'),
+    resource_path: z
+      .string()
+      .optional()
+      .describe('Path of a .tex file in the project to compile as the root document. E.g. "paper.tex", "folder/test.tex"'),
   },
-  async ({ project_id }) =>
+  async ({ project_id, resource_path }) =>
     wrapTool(async () => {
       const client = await getClient();
-      return client.compileWithOutputs(project_id);
+      return client.compileWithOutputs(project_id, resource_path);
+    })
+);
+
+// ---------------------------------------------------------------------------
+// Tool: rename_project
+// ---------------------------------------------------------------------------
+
+server.tool(
+  'rename_project',
+  'Rename an Overleaf project itself (not a file inside it). Use rename_entity for files and folders.',
+  {
+    project_id: z.string().describe('The Overleaf project ID'),
+    new_name: z.string().describe('New project name'),
+  },
+  async ({ project_id, new_name }) =>
+    wrapTool(async () => {
+      const client = await getClient();
+      await client.renameProject(project_id, new_name);
+      return { project_id, new_name };
+    })
+);
+
+// ---------------------------------------------------------------------------
+// Tool: plan_project_renames
+//
+// Deliberately plan-only. There is no apply counterpart on the MCP surface:
+// a bulk rename across an entire account is unrecoverable (Overleaf keeps no
+// project-name history), and an agent that can trigger it on a
+// misunderstood instruction is a risk with no matching benefit. The agent
+// computes and explains the plan; a human runs
+// `olcli project rename-bulk --apply`.
+// ---------------------------------------------------------------------------
+
+server.tool(
+  'plan_project_renames',
+  'Preview a bulk project rename across the account. Returns the planned renames, skipped projects and any name collisions. This tool NEVER renames anything - applying the plan requires the human to run `olcli project rename-bulk --apply` in a terminal.',
+  {
+    match: z
+      .string()
+      .optional()
+      .describe('Regex; only projects whose name matches are considered'),
+    search: z
+      .string()
+      .optional()
+      .describe('Literal substring to replace (not a regex)'),
+    replace: z
+      .string()
+      .optional()
+      .describe('Replacement text; supports $1/$2 backrefs when used with match'),
+    prefix: z.string().optional().describe('Text to prepend to the name'),
+    suffix: z.string().optional().describe('Text to append to the name'),
+  },
+  async ({ match, search, replace, prefix, suffix }) =>
+    wrapTool(async () => {
+      const client = await getClient();
+      const projects = await client.listProjects();
+      const plan = planProjectRenames(projects, { match, search, replace, prefix, suffix });
+      return {
+        ...plan,
+        applied: false,
+        note:
+          plan.collisions.length > 0
+            ? 'Collisions present. Overleaf allows duplicate names, so applying this would succeed silently and leave indistinguishable projects. Fix the pattern before proceeding.'
+            : 'Preview only. Run `olcli project rename-bulk --apply` to execute.',
+      };
+    })
+);
+
+// ---------------------------------------------------------------------------
+// Tool: diff_project
+// ---------------------------------------------------------------------------
+
+server.tool(
+  'diff_project',
+  'Compare local files against the current remote state of an Overleaf project and return the content-level differences. Read-only: nothing is uploaded or written. This is the MCP counterpart of `olcli diff`.',
+  {
+    project_id: z.string().describe('The Overleaf project ID'),
+    local_dir: z.string().describe('Local directory to compare against the remote project'),
+    file: z
+      .string()
+      .optional()
+      .describe('Restrict the comparison to a single path, as it appears in the project'),
+    name_only: z
+      .boolean()
+      .optional()
+      .default(false)
+      .describe('Omit the patch text and return only paths and statuses (default: false)'),
+    context: z
+      .number()
+      .int()
+      .min(0)
+      .optional()
+      .default(3)
+      .describe('Lines of context around each hunk (default: 3)'),
+    no_default_ignore: z
+      .boolean()
+      .optional()
+      .default(false)
+      .describe('Disable the built-in LaTeX artifact ignore list; only .olignore applies'),
+    no_ignore: z
+      .boolean()
+      .optional()
+      .default(false)
+      .describe('Disable all ignore filtering on both sides'),
+  },
+  async ({ project_id, local_dir, file, name_only, context, no_default_ignore, no_ignore }) =>
+    wrapTool(async () => {
+      const targetDir = resolve(local_dir);
+      if (!existsSync(targetDir)) {
+        throw new Error(`Directory not found: ${targetDir}`);
+      }
+
+      const client = await getClient();
+
+      // Fetched fresh on every call, exactly like `olcli diff`. The manifest
+      // records remote paths, never remote contents, so there is no snapshot to
+      // compare against - and a diff that does not describe what a subsequent
+      // push would overwrite answers a different question than the one asked.
+      // One request: downloadProject returns the whole project as one archive.
+      const zipBuffer = await client.downloadProject(project_id);
+      const fetchedAt = new Date().toISOString();
+      const zip = new AdmZip(zipBuffer);
+
+      const ignoreCtx = loadIgnore(targetDir, {
+        noDefaults: no_default_ignore,
+        disableAll: no_ignore,
+      });
+
+      // Both sides go through the same filters. Filtering only the local side
+      // would report every build artifact sitting on Overleaf as a deletion.
+      const remoteFiles = filterRemoteTree(
+        zip
+          .getEntries()
+          .filter((e) => !e.isDirectory)
+          .map((e) => ({ path: e.entryName, data: e.getData() })),
+        ignoreCtx,
+        (path) => resolveWithin(targetDir, path) !== null,
+      );
+
+      const scan = scanLocalFiles(targetDir, ignoreCtx);
+      const localFiles = new Map<string, Buffer>();
+      for (const localFile of scan.files) {
+        localFiles.set(localFile.relativePath, readFileSync(localFile.path));
+      }
+
+      let entries = compareTrees(localFiles, remoteFiles).filter((e) => e.status !== 'unchanged');
+
+      if (file) {
+        const wanted = normalizeRemotePath(file);
+        entries = entries.filter((e) => e.path === wanted);
+      }
+
+      const files = entries.map((entry) => ({
+        path: entry.path,
+        status: entry.status,
+        binary: entry.binary,
+        // Only a plain push uploads and overwrites; remote-only files survive it,
+        // so calling them "deleted" without this flag would misdescribe the effect.
+        removed_only_by_push_delete: entry.status === 'deleted',
+        ...(name_only
+          ? {}
+          : {
+              patch: renderFileDiff(
+                entry,
+                localFiles.get(entry.path),
+                remoteFiles.get(entry.path),
+                { context },
+              ),
+            }),
+      }));
+
+      return {
+        project_id,
+        local_dir: targetDir,
+        // The remote was read at this instant. A collaborator editing between
+        // this call and a later push can still change the outcome.
+        remote_fetched_at: fetchedAt,
+        changed_count: files.length,
+        files,
+        note:
+          files.length === 0
+            ? 'No differences.'
+            : 'Patches are oriented a/ = remote, b/ = local: + is content a push would upload, - is content it would overwrite.',
+      };
+    })
+);
+
+// ---------------------------------------------------------------------------
+// Tool: create_project
+// ---------------------------------------------------------------------------
+
+server.tool(
+  'create_project',
+  'Create a new Overleaf project and return its id, name and URL. Unlike plan_project_renames, this one does apply: creating is additive, nothing existing is overwritten, and an unwanted project can be deleted afterwards.',
+  {
+    name: z.string().describe('Project name'),
+    template: z
+      .enum(['blank', 'example'])
+      .optional()
+      .default('blank')
+      .describe('Project template: an empty project, or Overleaf\'s example document'),
+  },
+  async ({ name, template }) =>
+    wrapTool(async () => {
+      const client = await getClient();
+      const created = await client.createProject(name, { template });
+      return {
+        ...created,
+        template,
+      };
     })
 );
 

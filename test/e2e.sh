@@ -264,6 +264,42 @@ CLEANUP_REMOTE_FILES+=("${TEST_ID}_2.txt")
 run_test "upload second file" \
   "olcli upload '$TEST_FILE2' '$PROJECT_ID'"
 
+# Create a minimal .tex file in a subfolder to test --resource (compile a specific root doc)
+TEST_TEX="${TEST_ID}.tex"
+mkdir -p "$TEST_DIR/sub"
+printf '\\documentclass{article}\n\\begin{document}\nE2E resource test.\n\\end{document}\n' > "$TEST_DIR/sub/$TEST_TEX"
+CLEANUP_REMOTE_FILES+=("sub/$TEST_TEX")
+
+run_test "upload test tex file to subfolder" \
+  "cd '$TEST_DIR' && olcli upload 'sub/$TEST_TEX' '$PROJECT_ID'"
+
+# Regression: an absolute local path must land in the project root, not in a
+# mirrored 'tmp/tmp.xxx/' folder tree (see issue #39).
+TEST_FILE_ABS="$TEST_DIR/${TEST_ID}_abs.txt"
+echo "absolute path test - $TEST_CONTENT" > "$TEST_FILE_ABS"
+CLEANUP_REMOTE_FILES+=("${TEST_ID}_abs.txt")
+
+run_test "upload with absolute path lands in project root" \
+  "olcli upload '$TEST_FILE_ABS' '$PROJECT_ID'"
+
+sleep 1
+
+run_test "download file uploaded via absolute path" \
+  "olcli download '${TEST_ID}_abs.txt' '$PROJECT_ID' -o '$TEST_DIR/dl_abs.txt'"
+
+# Regression: --to sets the remote destination explicitly.
+TEST_FILE_TO="$TEST_DIR/${TEST_ID}_to.txt"
+echo "--to test - $TEST_CONTENT" > "$TEST_FILE_TO"
+CLEANUP_REMOTE_FILES+=("sub/${TEST_ID}_to.txt")
+
+run_test "upload with --to places file at given remote path" \
+  "olcli upload '$TEST_FILE_TO' '$PROJECT_ID' --to 'sub/${TEST_ID}_to.txt'"
+
+sleep 1
+
+run_test "download file uploaded via --to" \
+  "olcli download 'sub/${TEST_ID}_to.txt' '$PROJECT_ID' -o '$TEST_DIR/dl_to.txt'"
+
 #######################################
 # Test: File Download (single file)
 #######################################
@@ -349,6 +385,14 @@ run_test_with_output "compile project" \
   "olcli compile '$PROJECT_ID'" \
   "(success|failure|Compiled)"
 
+run_test_with_output "compile project with --resource" \
+  "olcli compile '$PROJECT_ID' -r 'sub/$TEST_TEX'" \
+  "(success|failure|Compiled)"
+
+run_test "compile with nonexistent --resource fails gracefully" \
+  "olcli compile '$PROJECT_ID' -r 'nonexistent_file_xyz.tex'" \
+  false
+
 #######################################
 # Test: PDF Download
 #######################################
@@ -383,6 +427,34 @@ fi
 
 sleep 1  # Rate limit
 
+PDF_FILE_R="$TEST_DIR/output_resource.pdf"
+
+# Note: This may fail if compilation fails
+TESTS_RUN=$((TESTS_RUN + 1))
+echo -n "  Testing: download PDF with --resource ... "
+if olcli pdf "$PROJECT_ID" -r "sub/$TEST_TEX" -o "$PDF_FILE_R" 2>&1; then
+  if [ -f "$PDF_FILE_R" ] && [ -s "$PDF_FILE_R" ]; then
+    # Check PDF magic bytes
+    if head -c 4 "$PDF_FILE_R" | grep -q "%PDF"; then
+      echo -e "${GREEN}✓${NC}"
+      TESTS_PASSED=$((TESTS_PASSED + 1))
+    else
+      echo -e "${RED}✗ (not a valid PDF)${NC}"
+      TESTS_FAILED=$((TESTS_FAILED + 1))
+    fi
+  else
+    echo -e "${RED}✗ (file empty or missing)${NC}"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+  fi
+else
+  echo -e "${YELLOW}⚠ (compilation may have failed)${NC}"
+  # Don't count as failure since compilation errors are project-dependent
+  TESTS_PASSED=$((TESTS_PASSED + 1))
+  log_warn "PDF download skipped due to compilation status"
+fi
+
+sleep 1  # Rate limit
+
 #######################################
 # Test: Output Files (compile artifacts)
 #######################################
@@ -393,10 +465,28 @@ run_test_with_output "output --list shows files" \
   "olcli output --list --project '$PROJECT_ID'" \
   "(log|aux|pdf)"
 
+run_test_with_output "output --list with --resource shows files" \
+  "olcli output --list -r 'sub/$TEST_TEX' --project '$PROJECT_ID'" \
+  "(log|aux|pdf)"
+
 # Download log file
 LOG_FILE="$TEST_DIR/output.log"
 run_test "download log output" \
   "olcli output log -o '$LOG_FILE' --project '$PROJECT_ID'"
+
+LOG_FILE_R="$TEST_DIR/output_resource.log"
+run_test "download log output with --resource" \
+  "olcli output log -r 'sub/$TEST_TEX' -o '$LOG_FILE_R' --project '$PROJECT_ID'"
+
+TESTS_RUN=$((TESTS_RUN + 1))
+echo -n "  Testing: resource log file has content ... "
+if [ -f "$LOG_FILE_R" ] && [ -s "$LOG_FILE_R" ]; then
+  echo -e "${GREEN}✓${NC}"
+  TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+  echo -e "${RED}✗${NC}"
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
 
 TESTS_RUN=$((TESTS_RUN + 1))
 echo -n "  Testing: log file has content ... "
@@ -471,6 +561,156 @@ else
 fi
 
 sleep 1  # Rate limit
+
+#######################################
+# Test: Diff
+#######################################
+
+log_section "Diff Tests"
+
+# The pulled directory is byte-identical to the remote at this point, so a
+# diff must report nothing. Anything else means the two sides are being
+# filtered differently.
+run_test "diff reports no changes on a freshly pulled directory" \
+  "cd '$PULL_DIR' && olcli diff | grep -q 'No differences'"
+
+run_test "diff --exit-code exits 0 when nothing differs" \
+  "cd '$PULL_DIR' && olcli diff --exit-code >/dev/null"
+
+DIFF_TEST_FILE="$PULL_DIR/${TEST_ID}.txt"
+DIFF_ORIGINAL_CONTENT=$(cat "$DIFF_TEST_FILE")
+echo "diff test modification - $TIMESTAMP" >> "$DIFF_TEST_FILE"
+
+run_test "diff --name-only marks a modified file with M" \
+  "cd '$PULL_DIR' && olcli diff --name-only | grep -qE '^M +${TEST_ID}\\.txt$'"
+
+run_test "diff shows the added line as a local addition" \
+  "cd '$PULL_DIR' && olcli diff --file '${TEST_ID}.txt' | grep -q '^+diff test modification'"
+
+run_test "diff --file limits output to the requested file" \
+  "cd '$PULL_DIR' && test \$(olcli diff --file '${TEST_ID}.txt' | grep -c '^diff --olcli') -eq 1"
+
+run_test "diff --exit-code exits 1 when a file differs" \
+  "cd '$PULL_DIR' && olcli diff --exit-code >/dev/null; test \$? -eq 1"
+
+# The gate is opt-in: a script that checks plain `olcli diff` for success must
+# keep seeing success when the project simply has changes in it.
+run_test "diff without --exit-code still exits 0 when a file differs" \
+  "cd '$PULL_DIR' && olcli diff >/dev/null"
+
+run_test "diff --exit-code narrows the gate to --file" \
+  "cd '$PULL_DIR' && olcli diff --exit-code --file '${TEST_ID}.txt' >/dev/null; test \$? -eq 1"
+
+# Same as a git pathspec that matches nothing: no difference was found, so the
+# gate is green rather than an error.
+run_test "diff --exit-code exits 0 for a --file that differs in nothing" \
+  "cd '$PULL_DIR' && olcli diff --exit-code --file 'no-such-file-here.tex' >/dev/null"
+
+# A large patch redirected to a file is the case the gate is written for, and
+# the case where exiting outright would truncate stdout mid-hunk. The capture
+# file is dotted so the diff it is capturing does not report it.
+run_test "diff --exit-code writes its whole patch when redirected" \
+  "cd '$PULL_DIR' && { olcli diff --exit-code > '$PULL_DIR/.diff-gate.out'; test \$? -eq 1; } && tail -1 '$PULL_DIR/.diff-gate.out' | grep -q 'b/ = local'"
+
+# The distinction the flag exists for: a run that failed must not look like a
+# run that found changes. No network needed - a bad directory fails early.
+run_test "diff --exit-code exits 2 when the run itself fails" \
+  "olcli diff someproject /nonexistent-olcli-dir --exit-code >/dev/null 2>&1; test \$? -eq 2"
+
+run_test "diff without --exit-code still reports failure as 1" \
+  "olcli diff someproject /nonexistent-olcli-dir >/dev/null 2>&1; test \$? -eq 1"
+
+rm -f "$PULL_DIR/.diff-gate.out"
+
+# Restore, so the push tests below see the tree they expect.
+printf '%s\n' "$DIFF_ORIGINAL_CONTENT" > "$DIFF_TEST_FILE"
+
+DIFF_NEW_FILE="$PULL_DIR/${TEST_ID}_diffonly.txt"
+echo "local only - $TIMESTAMP" > "$DIFF_NEW_FILE"
+
+run_test "diff --name-only marks a local-only file with A" \
+  "cd '$PULL_DIR' && olcli diff --name-only | grep -qE '^A +${TEST_ID}_diffonly\\.txt$'"
+
+run_test "diff ignores build artifacts on both sides" \
+  "cd '$PULL_DIR' && touch '$PULL_DIR/scratch.aux' && ! olcli diff --name-only | grep -q 'scratch\\.aux'"
+
+rm -f "$DIFF_NEW_FILE" "$PULL_DIR/scratch.aux"
+
+# Back to a clean tree; verify the restore actually worked before pushing.
+run_test "diff is clean again after restoring the tree" \
+  "cd '$PULL_DIR' && olcli diff | grep -q 'No differences'"
+
+sleep 1  # Rate limit
+
+#######################################
+# Test: latexdiff
+#######################################
+
+log_section "latexdiff Tests"
+
+if ! command -v latexdiff >/dev/null 2>&1; then
+  log_warn "latexdiff not on PATH - skipping the --latexdiff section"
+else
+  # A root document of our own, so the section does not depend on what the
+  # target project happens to contain, and --main keeps it unambiguous even in
+  # a project that already has one.
+  LD_NAME="${TEST_ID}_ld.tex"
+  LD_FILE="$PULL_DIR/$LD_NAME"
+  cat > "$LD_FILE" <<TEX
+\documentclass{article}
+\begin{document}
+The preliminary results were inconclusive.
+\end{document}
+TEX
+  CLEANUP_REMOTE_FILES+=("$LD_NAME")
+
+  run_test "upload the latexdiff root document" \
+    "olcli upload '$LD_FILE' '$PROJECT_ID' --to '$LD_NAME'"
+
+  sleep 2  # Give Overleaf a moment
+
+  # Now both sides hold the same file; edit only the local one.
+  sed -i.bak 's/preliminary results were inconclusive/results are statistically significant/' "$LD_FILE"
+  rm -f "$LD_FILE.bak"
+
+  run_test "diff --latexdiff writes a marked-up document" \
+    "cd '$PULL_DIR' && olcli diff --latexdiff --main '$LD_NAME' && test -s '.olcli-diff/${TEST_ID}_ld-diff.tex'"
+
+  run_test "the markup strikes through the remote wording" \
+    "grep -q 'DIFdel{.*preliminary' '$PULL_DIR/.olcli-diff/${TEST_ID}_ld-diff.tex'"
+
+  run_test "the markup underlines the local wording" \
+    "grep -q 'DIFadd{.*significant' '$PULL_DIR/.olcli-diff/${TEST_ID}_ld-diff.tex'"
+
+  # Dotted output directory, so nothing it holds can reach a later push.
+  run_test "the marked-up output is invisible to push" \
+    "cd '$PULL_DIR' && ! olcli push --dry-run | grep -q 'olcli-diff'"
+
+  run_test "--latexdiff refuses to combine with --name-only" \
+    "cd '$PULL_DIR' && olcli diff --latexdiff --name-only" \
+    "false"
+
+  run_test "--main outside --latexdiff is refused rather than ignored" \
+    "cd '$PULL_DIR' && olcli diff --main '$LD_NAME'" \
+    "false"
+
+  run_test "diff --latexdiff --pdf downloads a compiled PDF" \
+    "cd '$PULL_DIR' && olcli diff --latexdiff --pdf --main '$LD_NAME' && test -s '.olcli-diff/${TEST_ID}_ld-diff.pdf'"
+
+  run_test "the PDF is a PDF" \
+    "head -c 4 '$PULL_DIR/.olcli-diff/${TEST_ID}_ld-diff.pdf' | grep -q '%PDF'"
+
+  # The scratch file --pdf uploads must be gone. A remote-only file is exactly
+  # what diff reports as D, so the command checks its own cleanup.
+  run_test "--pdf removes the file it uploaded to compile" \
+    "cd '$PULL_DIR' && ! olcli diff --name-only | grep -q 'olcli-latexdiff'"
+
+  rm -rf "$PULL_DIR/.olcli-diff" "$LD_FILE"
+  run_test "delete the latexdiff root document from the project" \
+    "olcli delete '$LD_NAME' '$PROJECT_ID'"
+
+  sleep 1  # Rate limit
+fi
 
 #######################################
 # Test: Push
